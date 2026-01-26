@@ -1,7 +1,7 @@
 # Shift Handoff Template
 
 **Date:** YYYY-MM-DD  
-**Shift:** A / B / C  
+**Shift:** Shift-Alpha / Shift-Beta / Shift-Gamma  
 **Line/Area:**  
 **Lead:**  
 

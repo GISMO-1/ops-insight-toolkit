@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tkinter as tk
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 
@@ -76,6 +77,9 @@ class MOITGui(tk.Tk):
         clear_btn = ttk.Button(top, text="Clear Output", command=self._clear_output)
         clear_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+        save_btn = ttk.Button(top, text="Save Results…", command=self._save_output)
+        save_btn.pack(side=tk.LEFT, padx=(8, 0))
+
         # Inputs frame
         inputs = ttk.LabelFrame(self, text="Inputs", padding=12)
         inputs.pack(side=tk.TOP, fill=tk.X, padx=12, pady=(0, 12))
@@ -125,6 +129,12 @@ class MOITGui(tk.Tk):
         yscroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.output_text.configure(yscrollcommand=yscroll.set)
 
+        # Status frame
+        status_frame = ttk.Frame(self, padding=(12, 0, 12, 12))
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
+
     def _refresh_visible_inputs(self) -> None:
         # Hide all input sections first
         for w in (self.csv_row, self.handoff_row, self.throughput_grid):
@@ -169,9 +179,52 @@ class MOITGui(tk.Tk):
     def _clear_output(self) -> None:
         self.output_text.delete("1.0", tk.END)
 
+    def _set_status(self, text: str) -> None:
+        self.status_var.set(text)
+        self.update_idletasks()
+
     def _append_output(self, text: str) -> None:
         self.output_text.insert(tk.END, text)
         self.output_text.see(tk.END)
+
+    def _save_output(self) -> None:
+        output = self.output_text.get("1.0", tk.END).strip()
+        if not output:
+            messagebox.showwarning("No output", "Run a tool to generate output before saving.")
+            self._set_status("Error: No output to save")
+            return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        tool = self.tool_var.get()
+        initial_name = f"{tool}_report_{timestamp}.txt"
+
+        path = filedialog.asksaveasfilename(
+            title="Save results",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=initial_name,
+            initialdir=REPO_ROOT,
+        )
+        if not path:
+            self._set_status("Save canceled")
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(output + "\n")
+        except OSError as exc:
+            messagebox.showerror("Save failed", f"Could not save results:\n{exc}")
+            self._set_status("Error: Save failed")
+            return
+
+        self._set_status(f"Saved results to {self._rel_or_abs(path)}")
+
+    def _validate_required(self, value: str, label: str) -> bool:
+        if not value.strip():
+            messagebox.showwarning("Missing input", f"Please provide a value for {label}.")
+            self._set_status(f"Error: Missing {label}")
+            return False
+        return True
 
     def _run_selected(self) -> None:
         tool = self.tool_var.get()
@@ -179,14 +232,37 @@ class MOITGui(tk.Tk):
         cmd = _python_cmd()
 
         if tool == "downtime":
-            cmd += ["downtime", "--csv", self.csv_path_var.get().strip()]
+            csv_path = self.csv_path_var.get()
+            if not self._validate_required(csv_path, "CSV file"):
+                return
+            cmd += ["downtime", "--csv", csv_path.strip()]
         elif tool == "safety":
-            cmd += ["safety", "--csv", self.csv_path_var.get().strip()]
+            csv_path = self.csv_path_var.get()
+            if not self._validate_required(csv_path, "CSV file"):
+                return
+            cmd += ["safety", "--csv", csv_path.strip()]
         elif tool == "handoff-validate":
-            cmd += ["handoff-validate", "--file", self.handoff_path_var.get().strip()]
+            handoff_path = self.handoff_path_var.get()
+            if not self._validate_required(handoff_path, "handoff file"):
+                return
+            cmd += ["handoff-validate", "--file", handoff_path.strip()]
         elif tool == "throughput":
             try:
                 # Validate numeric inputs early so we can give a clean message
+                if not self._validate_required(self.nominal_rate_var.get(), "nominal rate"):
+                    return
+                if not self._validate_required(self.minor_stops_per_hour_var.get(), "minor stops per hour"):
+                    return
+                if not self._validate_required(self.avg_minor_stop_min_var.get(), "average minor stop minutes"):
+                    return
+                if not self._validate_required(self.changeovers_per_shift_var.get(), "changeovers per shift"):
+                    return
+                if not self._validate_required(self.changeover_min_var.get(), "changeover minutes"):
+                    return
+                if not self._validate_required(self.shift_length_hours_var.get(), "shift length hours"):
+                    return
+                if not self._validate_required(self.staffing_factor_var.get(), "staffing factor"):
+                    return
                 float(self.nominal_rate_var.get())
                 float(self.minor_stops_per_hour_var.get())
                 float(self.avg_minor_stop_min_var.get())
@@ -196,6 +272,7 @@ class MOITGui(tk.Tk):
                 float(self.staffing_factor_var.get())
             except ValueError:
                 messagebox.showerror("Invalid input", "Throughput fields must be numeric.")
+                self._set_status("Error: Invalid numeric input")
                 return
 
             cmd += [
@@ -219,8 +296,10 @@ class MOITGui(tk.Tk):
             cmd += ["test"]
         else:
             messagebox.showerror("Unknown tool", f"Unknown tool: {tool}")
+            self._set_status("Error: Unknown tool")
             return
 
+        self._set_status("Running...")
         self._append_output(f"$ {' '.join(cmd)}\n\n")
 
         try:
@@ -232,6 +311,7 @@ class MOITGui(tk.Tk):
             )
         except Exception as exc:
             self._append_output(f"ERROR: failed to run command: {exc}\n")
+            self._set_status("Error: Failed to run command")
             return
 
         if proc.stdout:
@@ -246,6 +326,7 @@ class MOITGui(tk.Tk):
                 self._append_output("\n")
 
         self._append_output(f"\n(exit code: {proc.returncode})\n\n")
+        self._set_status("Complete" if proc.returncode == 0 else f"Error: Exit code {proc.returncode}")
 
 
 def main() -> None:

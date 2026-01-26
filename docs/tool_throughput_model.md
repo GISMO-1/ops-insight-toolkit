@@ -12,6 +12,11 @@ Estimate expected shift output using a simple time-loss model (minor stops + cha
 - Shift length (hours)
 - Staffing factor (default 1.0)
 
+## Outputs
+- Expected output per shift (units).
+- Downtime breakdown in minutes.
+- Sensitivity table showing +/-10% impact on output per input.
+
 ## Assumptions and Formulas
 - Total shift minutes = shift length * 60.
 - Minor-stop downtime = minor_stops_per_hour * avg_minor_stop_min * shift_length_hours.
@@ -43,4 +48,10 @@ Sensitivity (+/-10% impact, units):
 - nominal_rate: -10% 1,278.0 | +10% 1,562.0 | impact 142.0
 - shift_length_hours: -10% 1,278.0 | +10% 1,562.0 | impact 142.0
 - minor_stops_per_hour: -10% 1,444.0 | +10% 1,396.0 | impact 24.0
+```
+
+## Self-check
+```bash
+python tools/throughput_model.py --nominal-rate 120 --minor-stops-per-hour 3 --avg-minor-stop-min 2 \
+  --changeovers-per-shift 1 --changeover-min 25 --shift-length-hours 12
 ```

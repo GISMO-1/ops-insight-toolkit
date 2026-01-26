@@ -1,7 +1,7 @@
 # Shift Handoff - Example
 
 **Date:** 2026-02-14
-**Shift:** B (14:00-22:00)
+**Shift:** Shift-Delta (14:00-22:00)
 **Line:** Packaging Line 2
 **Lead:** J. Rivera
 

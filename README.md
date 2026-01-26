@@ -34,6 +34,7 @@ No proprietary systems, processes, or confidential information are referenced or
 
 ## Repository Structure
 - `/data` — Example datasets (synthetic)
+- `/data` includes a larger stress-test dataset (`sample_downtime_large.csv`) for demo walkthroughs.
 - `/tools` — Small analysis scripts + unified runner
 - `/models` — Simple throughput and constraint models
 - `/docs` — Assumptions, limitations, and tool documentation
@@ -52,6 +53,10 @@ No proprietary systems, processes, or confidential information are referenced or
   - `python -m tools.run handoff-validate --file docs/sample_handoff.md`
 - Run unit tests:
   - `python -m tools.run test`
+
+**Data flexibility notes**
+- Shift labels and equipment names are free-form strings pulled directly from your CSV inputs.
+- CSV headers are matched using common aliases (e.g., `shift label`, `machine`, `duration minutes`) so you do not need exact header names.
 
 ### Direct tool entrypoints (also supported)
 
@@ -74,6 +79,14 @@ No proprietary systems, processes, or confidential information are referenced or
 - [Throughput Sensitivity Model](docs/tool_throughput_model.md)
 - [Safety Observation Trend Analyzer](docs/tool_safety_trend_analyzer.md)
 - [Shift Handoff Template + Validator](docs/tool_handoff_validator.md)
+- [GUI Wrapper](docs/tool_gui.md)
+
+## GUI Wrapper (Tkinter)
+**Purpose:** Provide a desktop interface for running MOIT CLI tools and viewing results in one window.  
+**Inputs:** Tool selection, CSV/Markdown files, and throughput parameters.  
+**Outputs:** Text results in the GUI output panel and optional exported `.txt`/`.csv` reports via **Save Results…**.  
+**Example command:** `python -m tools.gui`  
+**Self-check:** Run the Downtime tool with `data/sample_downtime.csv`, confirm output appears, and save a report file.  
 
 ---
 
@@ -84,19 +97,19 @@ No proprietary systems, processes, or confidential information are referenced or
 python -m tools.run downtime --csv data/sample_downtime.csv
 
 Top causes by downtime minutes:
-- Bearing wear: 290 min (12.3%)
-- Spill cleanup: 213 min (9.0%)
-- Rework hold: 193 min (8.2%)
+- Guard reset: 571 min (12.3%)
+- Material shortage: 543 min (11.7%)
+- Format swap: 517 min (11.1%)
 
 Downtime minutes by shift:
-- A: 1025 min
-- B: 603 min
-- C: 730 min
+- Shift-Alpha: 914 min
+- Shift-Beta: 1111 min
+- Shift-Zeta: 695 min
 
 Hot hours (downtime minutes by hour):
-- 0: 130 min
+- 0: 395 min
 - 1: 218 min
-- 2: 80 min
+- 2: 160 min
 ````
 
 ### Throughput Sensitivity Model
