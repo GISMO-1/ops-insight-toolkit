@@ -39,6 +39,9 @@ No proprietary systems, processes, or confidential information are referenced or
 /models - Simple throughput and constraint models
 /docs - Assumptions, limitations, and future ideas
 
+## Tools
+- [Downtime Pattern Analyzer](docs/tool_downtime_analyzer.md)
+
 
 ## Design Philosophy
 Manufacturing systems are complex, tightly coupled, and sensitive to small changes.  
