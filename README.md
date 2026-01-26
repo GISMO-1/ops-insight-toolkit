@@ -88,6 +88,9 @@ No proprietary systems, processes, or confidential information are referenced or
 **Example command:** `python -m tools.gui`  
 **Self-check:** Run the Downtime tool with `data/sample_downtime.csv`, confirm output appears, and save a report file.  
 
+## Packaging as a Standalone Executable
+See [Packaging MOIT as a Standalone Windows Executable](docs/packaging_moit_exe.md) for the PyInstaller command, bundled data notes, and validation checklist.  
+
 ---
 
 ## Example Outputs
