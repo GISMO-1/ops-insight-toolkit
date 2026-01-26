@@ -1,8 +1,17 @@
-"""Safety observation trend analyzer for synthetic observations."""
+"""Safety observation trend analyzer for synthetic observations.
+
+README
+Purpose: Summarize safety observations by severity, area, and weekly trend.
+Inputs/Outputs: CSV input path; returns a human-readable text report string.
+Example command: python tools/safety_trend_analyzer.py data/sample_safety_observations.csv
+Self-check: python tools/safety_trend_analyzer.py --self-check
+"""
 
 from __future__ import annotations
 
+import argparse
 import csv
+import os
 import statistics
 import sys
 from collections import Counter
@@ -41,6 +50,14 @@ class SafetyObservation:
 
 class SafetyTrendError(ValueError):
     """Raised when safety trend analyzer input is invalid."""
+
+
+def get_tool_metadata() -> dict:
+    return {
+        "name": "Safety Observation Trend Analyzer",
+        "description": "Highlights safety observation counts, severities, and weekly trends.",
+        "input_type": "csv",
+    }
 
 
 def _normalize_column(name: str) -> str:
@@ -181,18 +198,47 @@ def render_report(data: dict) -> str:
     return "\n".join(lines)
 
 
+def run_analysis(input_path: str) -> str:
+    observations = load_observations(input_path)
+    return render_report(analyze(observations))
+
+
+def self_check() -> tuple[bool, str]:
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sample_path = os.path.join(repo_root, "data", "sample_safety_observations.csv")
+    try:
+        report = run_analysis(sample_path)
+    except (SafetyTrendError, FileNotFoundError, OSError) as exc:
+        return False, f"Self-check failed: {exc}"
+    return True, f"Self-check passed ({len(report.splitlines())} report lines)."
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Analyze safety observation trends.")
+    parser.add_argument("csv", nargs="?", help="Path to safety observations CSV")
+    parser.add_argument("--self-check", action="store_true", help="Run a quick self-check")
+    return parser
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("Usage: python tools/safety_trend_analyzer.py <path/to/observations.csv>")
+    parser = _build_parser()
+    args = parser.parse_args(argv[1:])
+
+    if args.self_check:
+        ok, message = self_check()
+        print(message)
+        return 0 if ok else 1
+
+    if not args.csv:
+        parser.print_usage()
         return 1
 
     try:
-        observations = load_observations(argv[1])
+        print(run_analysis(args.csv))
     except (SafetyTrendError, FileNotFoundError, OSError) as exc:
         print(f"Error: {exc}")
         return 1
 
-    print(render_report(analyze(observations)))
     return 0
 
 
