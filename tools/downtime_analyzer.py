@@ -1,8 +1,17 @@
-"""Downtime pattern analyzer for synthetic downtime events."""
+"""Downtime pattern analyzer for synthetic downtime events.
+
+README
+Purpose: Summarize downtime event patterns by cause, equipment, shift, and hour.
+Inputs/Outputs: CSV input path; returns a human-readable text report string.
+Example command: python tools/downtime_analyzer.py data/sample_downtime.csv
+Self-check: python tools/downtime_analyzer.py --self-check
+"""
 
 from __future__ import annotations
 
+import argparse
 import csv
+import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -46,6 +55,14 @@ class DowntimeEvent:
 
 class DowntimeAnalyzerError(ValueError):
     """Raised when downtime analyzer input is invalid."""
+
+
+def get_tool_metadata() -> dict:
+    return {
+        "name": "Downtime Pattern Analyzer",
+        "description": "Summarizes downtime minutes by cause, equipment, shift, and hour.",
+        "input_type": "csv",
+    }
 
 
 def _normalize_column(name: str) -> str:
@@ -171,18 +188,47 @@ def render_report(events: Iterable[DowntimeEvent]) -> str:
     return "\n".join(report_lines)
 
 
+def run_analysis(input_path: str) -> str:
+    events = load_events(input_path)
+    return render_report(events)
+
+
+def self_check() -> tuple[bool, str]:
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sample_path = os.path.join(repo_root, "data", "sample_downtime.csv")
+    try:
+        report = run_analysis(sample_path)
+    except (DowntimeAnalyzerError, FileNotFoundError, OSError) as exc:
+        return False, f"Self-check failed: {exc}"
+    return True, f"Self-check passed ({len(report.splitlines())} report lines)."
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Analyze downtime patterns.")
+    parser.add_argument("csv", nargs="?", help="Path to downtime CSV")
+    parser.add_argument("--self-check", action="store_true", help="Run a quick self-check")
+    return parser
+
+
 def main(argv: List[str]) -> int:
-    if len(argv) != 2:
-        print("Usage: python tools/downtime_analyzer.py <path/to/downtime.csv>")
+    parser = _build_parser()
+    args = parser.parse_args(argv[1:])
+
+    if args.self_check:
+        ok, message = self_check()
+        print(message)
+        return 0 if ok else 1
+
+    if not args.csv:
+        parser.print_usage()
         return 1
 
     try:
-        events = load_events(argv[1])
+        print(run_analysis(args.csv))
     except (DowntimeAnalyzerError, FileNotFoundError, OSError) as exc:
         print(f"Error: {exc}")
         return 1
 
-    print(render_report(events))
     return 0
 
 

@@ -1,8 +1,17 @@
-"""Throughput sensitivity model for shift-level output estimates."""
+"""Throughput sensitivity model for shift-level output estimates.
+
+README
+Purpose: Estimate shift throughput and show sensitivity by key parameters.
+Inputs/Outputs: JSON or CLI parameters; returns a human-readable text report string.
+Example command: python tools/throughput_model.py --nominal-rate 120 --minor-stops-per-hour 3 --avg-minor-stop-min 2 --changeovers-per-shift 1 --changeover-min 25 --shift-length-hours 12 --staffing-factor 1.0
+Self-check: python tools/throughput_model.py --self-check
+"""
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from dataclasses import dataclass, replace
 
@@ -20,6 +29,14 @@ class ThroughputInputs:
 
 class ThroughputModelError(ValueError):
     """Raised when throughput model inputs are invalid."""
+
+
+def get_tool_metadata() -> dict:
+    return {
+        "name": "Throughput Sensitivity Model",
+        "description": "Estimates output per shift and shows sensitivity to key assumptions.",
+        "input_type": "throughput",
+    }
 
 
 def validate_inputs(inputs: ThroughputInputs) -> None:
@@ -133,6 +150,60 @@ def render_report(inputs: ThroughputInputs) -> str:
     return "\n".join(lines)
 
 
+def _inputs_from_json(path: str) -> ThroughputInputs:
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ThroughputModelError("Input JSON must be an object of throughput parameters.")
+    try:
+        return ThroughputInputs(
+            nominal_rate=float(payload["nominal_rate"]),
+            minor_stops_per_hour=float(payload["minor_stops_per_hour"]),
+            avg_minor_stop_min=float(payload["avg_minor_stop_min"]),
+            changeovers_per_shift=float(payload["changeovers_per_shift"]),
+            changeover_min=float(payload["changeover_min"]),
+            shift_length_hours=float(payload["shift_length_hours"]),
+            staffing_factor=float(payload.get("staffing_factor", 1.0)),
+        )
+    except KeyError as exc:
+        raise ThroughputModelError(f"Missing required input: {exc}") from exc
+    except (TypeError, ValueError) as exc:
+        raise ThroughputModelError(f"Invalid input value: {exc}") from exc
+
+
+def run_analysis(input_path: str) -> str:
+    if not input_path:
+        raise ThroughputModelError("Input path is required for throughput analysis.")
+    inputs = _inputs_from_json(input_path)
+    return render_report(inputs)
+
+
+def self_check() -> tuple[bool, str]:
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sample_payload = {
+        "nominal_rate": 120,
+        "minor_stops_per_hour": 3,
+        "avg_minor_stop_min": 2,
+        "changeovers_per_shift": 1,
+        "changeover_min": 25,
+        "shift_length_hours": 12,
+        "staffing_factor": 1.0,
+    }
+    sample_path = os.path.join(repo_root, "data", "sample_throughput_inputs.json")
+    try:
+        with open(sample_path, "w", encoding="utf-8") as handle:
+            json.dump(sample_payload, handle)
+        report = run_analysis(sample_path)
+    except (OSError, ThroughputModelError) as exc:
+        return False, f"Self-check failed: {exc}"
+    finally:
+        try:
+            os.remove(sample_path)
+        except OSError:
+            pass
+    return True, f"Self-check passed ({len(report.splitlines())} report lines)."
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Estimate throughput and sensitivity.")
     parser.add_argument("--nominal-rate", type=float, required=True)
@@ -142,10 +213,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--changeover-min", type=float, required=True)
     parser.add_argument("--shift-length-hours", type=float, required=True)
     parser.add_argument("--staffing-factor", type=float, default=1.0)
+    parser.add_argument("--self-check", action="store_true", help="Run a quick self-check")
     return parser
 
 
 def main(argv: list[str]) -> int:
+    if "--self-check" in argv:
+        ok, message = self_check()
+        print(message)
+        return 0 if ok else 1
+
     parser = build_parser()
     args = parser.parse_args(argv[1:])
 

@@ -5,18 +5,23 @@ Run:
 or:
   python tools/gui.py
 
-This GUI shells out to the unified runner (tools/run.py) and displays stdout/stderr.
+This GUI dynamically loads tool modules from the tools/ directory and displays results.
 """
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tempfile
+import traceback
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
@@ -37,9 +42,14 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 
-def _python_cmd() -> list[str]:
-    # Always prefer module invocation (most reliable for imports)
-    return [sys.executable, "-m", "tools.run"]
+@dataclass(frozen=True)
+class ToolInfo:
+    module_name: str
+    display_name: str
+    description: str
+    input_type: str
+    module: object
+    path: str
 
 
 def _resource_path(*parts: str) -> str:
@@ -79,6 +89,7 @@ def _load_config() -> dict[str, str | bool]:
         "output_dir": _default_output_dir(),
         "log_to_file": True,
         "sample_dir": _sample_dir(),
+        "tool_dev_mode": False,
     }
     path = _config_path()
     try:
@@ -108,6 +119,71 @@ def _open_path(path: str) -> None:
         subprocess.run(["open", path], check=False)
     else:
         subprocess.run(["xdg-open", path], check=False)
+
+
+def _discover_tools() -> tuple[list[ToolInfo], list[str]]:
+    tools_dir = os.path.join(REPO_ROOT, "tools")
+    errors: list[str] = []
+    candidates: list[tuple[str, str]] = []
+    for filename in os.listdir(tools_dir):
+        if not filename.endswith(".py"):
+            continue
+        module_name = filename[:-3]
+        if module_name.startswith("_") or module_name in {"__init__", "gui", "run"}:
+            continue
+        path = os.path.join(tools_dir, filename)
+        candidates.append((module_name, path))
+
+    tools: list[ToolInfo] = []
+    importlib.invalidate_caches()
+    for module_name, path in sorted(candidates):
+        try:
+            module = importlib.import_module(f"tools.{module_name}")
+        except Exception as exc:
+            errors.append(f"Failed to import tools.{module_name}: {exc}")
+            continue
+        if not hasattr(module, "run_analysis"):
+            continue
+        metadata: dict = {}
+        if hasattr(module, "get_tool_metadata"):
+            try:
+                metadata = module.get_tool_metadata() or {}
+            except Exception as exc:
+                errors.append(f"Failed to read metadata for tools.{module_name}: {exc}")
+        display_name = metadata.get("name") or module_name.replace("_", " ").title()
+        description = metadata.get("description") or ""
+        input_type = metadata.get("input_type") or "csv"
+        tools.append(
+            ToolInfo(
+                module_name=module_name,
+                display_name=display_name,
+                description=description,
+                input_type=input_type,
+                module=module,
+                path=path,
+            )
+        )
+
+    name_counts: dict[str, int] = {}
+    for tool in tools:
+        name_counts[tool.display_name] = name_counts.get(tool.display_name, 0) + 1
+    updated_tools: list[ToolInfo] = []
+    for tool in tools:
+        display_name = tool.display_name
+        if name_counts.get(display_name, 0) > 1:
+            display_name = f"{display_name} ({tool.module_name})"
+        updated_tools.append(
+            ToolInfo(
+                module_name=tool.module_name,
+                display_name=display_name,
+                description=tool.description,
+                input_type=tool.input_type,
+                module=tool.module,
+                path=tool.path,
+            )
+        )
+
+    return sorted(updated_tools, key=lambda t: t.display_name.lower()), errors
 
 
 class Tooltip:
@@ -151,7 +227,11 @@ class MOITGui(tk.Tk):
         self.minsize(900, 600)
 
         self.config_data = _load_config()
-        self.tool_var = tk.StringVar(value="downtime")
+        self.tools: list[ToolInfo] = []
+        self.tools_by_display: dict[str, ToolInfo] = {}
+        self.tool_var = tk.StringVar()
+        self.tool_desc_var = tk.StringVar()
+        self.tool_dev_mode_var = tk.BooleanVar(value=bool(self.config_data.get("tool_dev_mode", False)))
         self.last_run_output = ""
         self.last_run_time = None
 
@@ -171,6 +251,7 @@ class MOITGui(tk.Tk):
         self.staffing_factor_var = tk.StringVar(value="1.0")
 
         self._ensure_sample_files()
+        self._load_tools(log_errors=False)
         self._build_ui()
         self._persist_output_dir()
         self._refresh_visible_inputs()
@@ -198,12 +279,13 @@ class MOITGui(tk.Tk):
         tool_combo = ttk.Combobox(
             top,
             textvariable=self.tool_var,
-            values=["downtime", "throughput", "safety", "handoff-validate", "test"],
+            values=self._tool_display_names(),
             state="readonly",
-            width=18,
+            width=28,
         )
+        self.tool_combo = tool_combo
         tool_combo.pack(side=tk.LEFT, padx=(8, 16))
-        tool_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_visible_inputs())
+        tool_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_tool_selected())
 
         run_btn = ttk.Button(top, text="Run", command=self._run_selected)
         run_btn.pack(side=tk.LEFT)
@@ -213,6 +295,35 @@ class MOITGui(tk.Tk):
 
         save_btn = ttk.Button(top, text="Save Results…", command=self._save_output)
         save_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        dev_toggle = ttk.Checkbutton(
+            top,
+            text="Tool Dev Mode",
+            variable=self.tool_dev_mode_var,
+            command=self._toggle_dev_mode,
+        )
+        dev_toggle.pack(side=tk.RIGHT)
+
+        desc_row = ttk.Frame(self, padding=(12, 0, 12, 6))
+        desc_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(desc_row, text="Description:", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.tool_desc_label = ttk.Label(
+            desc_row,
+            textvariable=self.tool_desc_var,
+            wraplength=720,
+            foreground="#4b5563",
+        )
+        self.tool_desc_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.dev_row = ttk.Frame(self, padding=(12, 0, 12, 8))
+        self.dev_reload_btn = ttk.Button(self.dev_row, text="Reload Tools", command=self._reload_tools)
+        self.dev_reload_btn.pack(side=tk.LEFT)
+        self.dev_open_btn = ttk.Button(self.dev_row, text="Open Tool Source", command=self._open_tool_source)
+        self.dev_open_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.dev_validate_btn = ttk.Button(
+            self.dev_row, text="Validate run_analysis()", command=self._validate_tool_signature
+        )
+        self.dev_validate_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         # Inputs frame
         inputs = ttk.LabelFrame(self, text="Inputs", padding=12)
@@ -320,28 +431,122 @@ class MOITGui(tk.Tk):
             save_btn,
         )
 
+        self._toggle_dev_mode()
+        self._on_tool_selected()
+
+    def _tool_display_names(self) -> list[str]:
+        return [tool.display_name for tool in self.tools]
+
+    def _load_tools(self, log_errors: bool = True) -> None:
+        tools, errors = _discover_tools()
+        self.tools = tools
+        self.tools_by_display = {tool.display_name: tool for tool in tools}
+        if not self.tool_var.get() and self.tools:
+            self.tool_var.set(self.tools[0].display_name)
+        if self.tool_var.get() not in self.tools_by_display and self.tools:
+            self.tool_var.set(self.tools[0].display_name)
+        if log_errors:
+            if not self.tools:
+                self._log("No tools discovered in the tools directory.", level="warning")
+            for error in errors:
+                self._log(error, level="error")
+
+    def _reload_tools(self) -> None:
+        self._load_tools(log_errors=True)
+        if hasattr(self, "tool_combo"):
+            self.tool_combo["values"] = self._tool_display_names()
+        self._on_tool_selected()
+        self._log("Reloaded tools from tools directory.")
+
+    def _selected_tool(self) -> ToolInfo | None:
+        return self.tools_by_display.get(self.tool_var.get())
+
+    def _on_tool_selected(self) -> None:
+        self._refresh_tool_description()
+        self._refresh_visible_inputs()
+
+    def _refresh_tool_description(self) -> None:
+        tool = self._selected_tool()
+        if tool:
+            self.tool_desc_var.set(tool.description or "No description provided.")
+        else:
+            self.tool_desc_var.set("No tool selected.")
+
+    def _toggle_dev_mode(self) -> None:
+        enabled = bool(self.tool_dev_mode_var.get())
+        self.config_data["tool_dev_mode"] = enabled
+        _save_config(self.config_data)
+        if enabled:
+            self.dev_row.pack(side=tk.TOP, fill=tk.X)
+        else:
+            self.dev_row.pack_forget()
+
+    def _open_tool_source(self) -> None:
+        tool = self._selected_tool()
+        if not tool:
+            messagebox.showwarning("No tool selected", "Select a tool to open its source file.")
+            return
+        if not os.path.isfile(tool.path):
+            messagebox.showerror("Missing source file", f"Tool source not found:\n{tool.path}")
+            return
+        try:
+            _open_path(tool.path)
+            self._log(f"Opened tool source: {tool.path}")
+        except OSError as exc:
+            messagebox.showerror("Open failed", f"Could not open the tool source:\n{exc}")
+            self._log(f"Failed to open tool source: {exc}", level="error")
+
+    def _validate_tool_signature(self) -> None:
+        tool = self._selected_tool()
+        if not tool:
+            messagebox.showwarning("No tool selected", "Select a tool to validate.")
+            return
+        issues: list[str] = []
+        if not hasattr(tool.module, "run_analysis"):
+            issues.append("Missing run_analysis() function.")
+        else:
+            sig = inspect.signature(tool.module.run_analysis)
+            params = list(sig.parameters.values())
+            if len(params) != 1 or params[0].name != "input_path":
+                issues.append("run_analysis() must accept exactly one parameter named input_path.")
+            if sig.return_annotation not in (inspect.Signature.empty, str):
+                issues.append("run_analysis() should return a str.")
+        if issues:
+            self._append_output("Signature validation issues:\n")
+            for issue in issues:
+                self._append_output(f"- {issue}\n")
+            self._set_status("Signature check failed", state="error")
+            self._log(f"Signature validation failed for {tool.module_name}: {issues}", level="error")
+        else:
+            self._append_output("Signature validation passed.\n")
+            self._set_status("Signature check passed", state="complete")
+            self._log(f"Signature validation passed for {tool.module_name}.")
+
     def _refresh_visible_inputs(self) -> None:
         # Hide all input sections first
         for w in (self.csv_row, self.handoff_row, self.throughput_grid):
             w.pack_forget()
 
-        tool = self.tool_var.get()
+        tool = self._selected_tool()
+        if not tool:
+            return
 
-        if tool in ("downtime", "safety"):
+        if tool.input_type == "csv":
             self.csv_row.pack(side=tk.TOP, fill=tk.X, pady=4)
-        elif tool == "handoff-validate":
+        elif tool.input_type == "handoff":
             self.handoff_row.pack(side=tk.TOP, fill=tk.X, pady=4)
-        elif tool == "throughput":
+        elif tool.input_type == "throughput":
             self.throughput_grid.pack(side=tk.TOP, fill=tk.X, pady=4)
-        elif tool == "test":
-            # no inputs
-            pass
 
     def _attach_tooltips(self, tool_combo: ttk.Combobox, run_btn: ttk.Button, clear_btn: ttk.Button, save_btn: ttk.Button) -> None:
         Tooltip(tool_combo, "Select which analysis tool to run.")
         Tooltip(run_btn, "Run the selected tool with the current inputs.")
         Tooltip(clear_btn, "Clear the output panel and reset the status.")
         Tooltip(save_btn, "Save the most recent output to a report file.")
+        Tooltip(self.tool_desc_label, "Tool description from metadata, when available.")
+        Tooltip(self.dev_reload_btn, "Reload tools from the tools directory.")
+        Tooltip(self.dev_open_btn, "Open the selected tool's source file in the default editor.")
+        Tooltip(self.dev_validate_btn, "Validate the selected tool's run_analysis() signature.")
         Tooltip(self.output_entry, "Reports will be saved here by default.")
         Tooltip(self.output_browse_btn, "Choose a folder for exported reports.")
         Tooltip(self.csv_entry, "CSV input file for downtime or safety analysis.")
@@ -483,6 +688,8 @@ class MOITGui(tk.Tk):
             f"Sample data dir: {sample_dir}\n"
             f"Output dir: {output_dir}\n"
             f"Output dir writable: {writable_output}\n"
+            f"Tool dev mode: {self.tool_dev_mode_var.get()}\n"
+            f"Discovered tools: {len(self.tools)}\n"
         )
         self.diagnostics_text.configure(state=tk.NORMAL)
         self.diagnostics_text.delete("1.0", tk.END)
@@ -531,8 +738,9 @@ class MOITGui(tk.Tk):
             return
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        tool = self.tool_var.get()
-        initial_name = f"{tool}_results_{timestamp}.txt"
+        tool = self._selected_tool()
+        tool_name = tool.module_name if tool else "tool"
+        initial_name = f"{tool_name}_results_{timestamp}.txt"
 
         output_dir = self.output_dir_var.get().strip() or _default_output_dir()
         try:
@@ -635,29 +843,29 @@ class MOITGui(tk.Tk):
         return numeric
 
     def _run_selected(self) -> None:
-        tool = self.tool_var.get()
+        tool = self._selected_tool()
+        if not tool:
+            messagebox.showerror("No tool selected", "Select a tool to run.")
+            self._set_status("Error: No tool selected", state="error")
+            return
 
         self._persist_output_dir()
         self._refresh_diagnostics()
 
-        cmd = _python_cmd()
+        input_path = ""
+        temp_path: str | None = None
 
-        if tool == "downtime":
+        if tool.input_type == "csv":
             csv_path = self.csv_path_var.get()
             if not self._validate_file(csv_path, "CSV file", expected_ext=".csv"):
                 return
-            cmd += ["downtime", "--csv", csv_path.strip()]
-        elif tool == "safety":
-            csv_path = self.csv_path_var.get()
-            if not self._validate_file(csv_path, "CSV file", expected_ext=".csv"):
-                return
-            cmd += ["safety", "--csv", csv_path.strip()]
-        elif tool == "handoff-validate":
+            input_path = self._resolve_path(csv_path.strip())
+        elif tool.input_type == "handoff":
             handoff_path = self.handoff_path_var.get()
             if not self._validate_file(handoff_path, "handoff file"):
                 return
-            cmd += ["handoff-validate", "--file", handoff_path.strip()]
-        elif tool == "throughput":
+            input_path = self._resolve_path(handoff_path.strip())
+        elif tool.input_type == "throughput":
             nominal_rate = self._validate_numeric_range(self.nominal_rate_var.get(), "Nominal rate", 1, 10000)
             minor_stops = self._validate_numeric_range(
                 self.minor_stops_per_hour_var.get(), "Minor stops per hour", 0, 60
@@ -683,76 +891,59 @@ class MOITGui(tk.Tk):
             ):
                 return
 
-            cmd += [
-                "throughput",
-                "--nominal-rate",
-                self.nominal_rate_var.get().strip(),
-                "--minor-stops-per-hour",
-                self.minor_stops_per_hour_var.get().strip(),
-                "--avg-minor-stop-min",
-                self.avg_minor_stop_min_var.get().strip(),
-                "--changeovers-per-shift",
-                self.changeovers_per_shift_var.get().strip(),
-                "--changeover-min",
-                self.changeover_min_var.get().strip(),
-                "--shift-length-hours",
-                self.shift_length_hours_var.get().strip(),
-                "--staffing-factor",
-                self.staffing_factor_var.get().strip(),
-            ]
-        elif tool == "test":
-            cmd += ["test"]
-        else:
-            messagebox.showerror("Unknown tool", f"Unknown tool: {tool}")
-            self._set_status("Error: Unknown tool", state="error")
-            self._log(f"Unknown tool selected: {tool}", level="error")
-            return
+            payload = {
+                "nominal_rate": nominal_rate,
+                "minor_stops_per_hour": minor_stops,
+                "avg_minor_stop_min": avg_minor_stop,
+                "changeovers_per_shift": changeovers,
+                "changeover_min": changeover_min,
+                "shift_length_hours": shift_length,
+                "staffing_factor": staffing_factor,
+            }
+            try:
+                with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as handle:
+                    json.dump(payload, handle)
+                    temp_path = handle.name
+                input_path = temp_path
+            except OSError as exc:
+                messagebox.showerror("Temp file error", f"Could not create temp file:\n{exc}")
+                self._set_status("Error: Temp file error", state="error")
+                self._log(f"Failed to create temp file: {exc}", level="error")
+                return
 
         self._set_status("Running analysis...", state="running")
-        self._append_output(f"$ {' '.join(cmd)}\n\n")
-        self._log(f"Running tool: {' '.join(cmd)}")
-
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=REPO_ROOT,
-                text=True,
-                capture_output=True,
-            )
-        except Exception as exc:
-            self._append_output(f"ERROR: failed to run command: {exc}\n")
-            self._set_status(f"Error: {exc}", state="error")
-            self._log(f"Failed to run command: {exc}", level="error")
-            return
+        input_label = input_path if input_path else "no input"
+        self._append_output(f"$ {tool.module_name} ({input_label})\n\n")
+        self._log(f"Running tool: {tool.module_name}")
 
         run_output_parts: list[str] = []
-        if proc.stdout:
-            self._append_output(proc.stdout)
-            run_output_parts.append(proc.stdout)
-            if not proc.stdout.endswith("\n"):
+        try:
+            result = tool.module.run_analysis(input_path)
+            output_text = result if isinstance(result, str) else str(result)
+            self._append_output(output_text)
+            run_output_parts.append(output_text)
+            if output_text and not output_text.endswith("\n"):
                 self._append_output("\n")
                 run_output_parts.append("\n")
-
-        if proc.stderr:
-            self._append_output("\n[stderr]\n")
-            run_output_parts.append("\n[stderr]\n")
-            self._append_output(proc.stderr)
-            run_output_parts.append(proc.stderr)
-            if not proc.stderr.endswith("\n"):
-                self._append_output("\n")
-                run_output_parts.append("\n")
-
-        self._append_output(f"\n(exit code: {proc.returncode})\n\n")
-        run_output_parts.append(f"\n(exit code: {proc.returncode})\n")
-        self.last_run_output = "".join(run_output_parts).strip()
-        if proc.returncode == 0:
+            self.last_run_output = "".join(run_output_parts).strip()
             self._set_status("Analysis complete", state="complete")
             self._log("Analysis completed successfully.")
-        else:
-            self._set_status(f"Error: Exit code {proc.returncode}", state="error")
-            messagebox.showerror("Tool error", f"The tool exited with code {proc.returncode}.\nCheck the Logs tab.")
-            self._log(f"Tool exited with code {proc.returncode}", level="error")
-        self._set_last_run_time()
+        except Exception:
+            trace = traceback.format_exc()
+            self._append_output("ERROR: Tool execution failed.\n\n")
+            self._append_output(trace)
+            if not trace.endswith("\n"):
+                self._append_output("\n")
+            self.last_run_output = f"ERROR: Tool execution failed.\n\n{trace}".strip()
+            self._set_status("Error: Tool execution failed", state="error")
+            self._log("Tool execution failed. See output for traceback.", level="error")
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            self._set_last_run_time()
 
 
 def main() -> None:
