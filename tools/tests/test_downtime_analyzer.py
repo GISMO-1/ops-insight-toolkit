@@ -29,6 +29,43 @@ class TestDowntimeAnalyzer(unittest.TestCase):
             with self.assertRaises(downtime_analyzer.DowntimeAnalyzerError):
                 downtime_analyzer.load_events(path)
 
+    def test_accepts_alias_columns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "alias.csv"
+            fieldnames = [
+                "event id",
+                "start time",
+                "end time",
+                "duration minutes",
+                "line area",
+                "machine",
+                "type",
+                "reason",
+                "shift label",
+                "comment",
+            ]
+            with path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "event id": "EVT-0001",
+                        "start time": "2026-01-05T08:00:00",
+                        "end time": "2026-01-05T08:15:00",
+                        "duration minutes": "15",
+                        "line area": "Assembly",
+                        "machine": "Line-01",
+                        "type": "Mechanical",
+                        "reason": "Jam clear",
+                        "shift label": "Shift-Alpha",
+                        "comment": "Reset completed.",
+                    }
+                )
+
+            events = downtime_analyzer.load_events(path)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].shift, "Shift-Alpha")
+
 
 if __name__ == "__main__":
     unittest.main()

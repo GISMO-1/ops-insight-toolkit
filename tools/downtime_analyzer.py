@@ -9,18 +9,25 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List
 
-REQUIRED_COLUMNS = [
-    "event_id",
-    "start_time",
-    "end_time",
-    "duration_min",
-    "area",
-    "equipment",
-    "category",
-    "cause",
-    "shift",
-    "notes",
-]
+REQUIRED_COLUMNS = {
+    "event_id": ["event_id", "event id", "event-id", "downtime_id", "downtime id"],
+    "start_time": ["start_time", "start time", "start", "start_timestamp", "start timestamp"],
+    "end_time": ["end_time", "end time", "end", "end_timestamp", "end timestamp"],
+    "duration_min": [
+        "duration_min",
+        "duration min",
+        "duration_minutes",
+        "duration minutes",
+        "minutes",
+        "duration",
+    ],
+    "area": ["area", "line", "line_area", "line area", "department"],
+    "equipment": ["equipment", "asset", "machine", "work_center", "work center"],
+    "category": ["category", "type"],
+    "cause": ["cause", "reason", "root_cause", "root cause"],
+    "shift": ["shift", "shift_label", "shift label", "shift_name", "shift name", "crew"],
+    "notes": ["notes", "note", "comments", "comment", "details"],
+}
 
 
 @dataclass(frozen=True)
@@ -41,10 +48,36 @@ class DowntimeAnalyzerError(ValueError):
     """Raised when downtime analyzer input is invalid."""
 
 
-def _validate_columns(fieldnames: Iterable[str]) -> None:
-    missing = [column for column in REQUIRED_COLUMNS if column not in fieldnames]
+def _normalize_column(name: str) -> str:
+    return "".join(
+        char.lower()
+        for char in name.strip().replace("-", "_").replace(" ", "_")
+        if char.isalnum() or char == "_"
+    )
+
+
+def _resolve_columns(fieldnames: Iterable[str]) -> dict[str, str]:
+    normalized = {_normalize_column(name): name for name in fieldnames}
+    resolved: dict[str, str] = {}
+    missing = []
+    for required, aliases in REQUIRED_COLUMNS.items():
+        match = None
+        for alias in aliases:
+            normalized_alias = _normalize_column(alias)
+            if normalized_alias in normalized:
+                match = normalized[normalized_alias]
+                break
+        if match is None:
+            missing.append(required)
+        else:
+            resolved[required] = match
+
     if missing:
-        raise DowntimeAnalyzerError("Missing required columns: " + ", ".join(missing))
+        raise DowntimeAnalyzerError(
+            "Missing required columns: " + ", ".join(missing)
+        )
+
+    return resolved
 
 
 def load_events(path: str) -> List[DowntimeEvent]:
@@ -52,30 +85,30 @@ def load_events(path: str) -> List[DowntimeEvent]:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
             raise DowntimeAnalyzerError("CSV file is missing a header row.")
-        _validate_columns(reader.fieldnames)
+        column_map = _resolve_columns(reader.fieldnames)
         events: List[DowntimeEvent] = []
         for row in reader:
-            start_time = datetime.fromisoformat(row["start_time"].strip())
-            end_time = datetime.fromisoformat(row["end_time"].strip())
-            duration_min = int(row["duration_min"].strip())
+            start_time = datetime.fromisoformat(row[column_map["start_time"]].strip())
+            end_time = datetime.fromisoformat(row[column_map["end_time"]].strip())
+            duration_min = int(row[column_map["duration_min"]].strip())
             actual_duration = int((end_time - start_time).total_seconds() / 60)
             if actual_duration != duration_min:
                 raise DowntimeAnalyzerError(
-                    f"Duration mismatch for event {row['event_id']}: "
+                    f"Duration mismatch for event {row[column_map['event_id']]}: "
                     f"expected {duration_min} min, got {actual_duration} min"
                 )
             events.append(
                 DowntimeEvent(
-                    event_id=row["event_id"].strip(),
+                    event_id=row[column_map["event_id"]].strip(),
                     start_time=start_time,
                     end_time=end_time,
                     duration_min=duration_min,
-                    area=row["area"].strip(),
-                    equipment=row["equipment"].strip(),
-                    category=row["category"].strip(),
-                    cause=row["cause"].strip(),
-                    shift=row["shift"].strip(),
-                    notes=row["notes"].strip(),
+                    area=row[column_map["area"]].strip(),
+                    equipment=row[column_map["equipment"]].strip(),
+                    category=row[column_map["category"]].strip(),
+                    cause=row[column_map["cause"]].strip(),
+                    shift=row[column_map["shift"]].strip(),
+                    notes=row[column_map["notes"]].strip(),
                 )
             )
 

@@ -10,17 +10,17 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Iterable
 
-REQUIRED_COLUMNS = [
-    "obs_id",
-    "date",
-    "area",
-    "category",
-    "severity",
-    "near_miss",
-    "corrective_action",
-    "closed_date",
-    "notes",
-]
+REQUIRED_COLUMNS = {
+    "obs_id": ["obs_id", "obs id", "observation_id", "observation id"],
+    "date": ["date", "observation_date", "observation date"],
+    "area": ["area", "line", "line_area", "line area", "department"],
+    "category": ["category", "type"],
+    "severity": ["severity", "risk", "risk_level", "risk level"],
+    "near_miss": ["near_miss", "near miss", "near_miss_flag", "near miss flag"],
+    "corrective_action": ["corrective_action", "corrective action", "action", "response"],
+    "closed_date": ["closed_date", "closed date", "closure_date", "closure date"],
+    "notes": ["notes", "note", "comments", "comment", "details"],
+}
 
 VALID_SEVERITIES = {"LOW", "MED", "HIGH"}
 VALID_NEAR_MISS = {"TRUE", "FALSE"}
@@ -43,10 +43,34 @@ class SafetyTrendError(ValueError):
     """Raised when safety trend analyzer input is invalid."""
 
 
-def _validate_columns(fieldnames: Iterable[str]) -> None:
-    missing = [column for column in REQUIRED_COLUMNS if column not in fieldnames]
+def _normalize_column(name: str) -> str:
+    return "".join(
+        char.lower()
+        for char in name.strip().replace("-", "_").replace(" ", "_")
+        if char.isalnum() or char == "_"
+    )
+
+
+def _resolve_columns(fieldnames: Iterable[str]) -> dict[str, str]:
+    normalized = {_normalize_column(name): name for name in fieldnames}
+    resolved: dict[str, str] = {}
+    missing = []
+    for required, aliases in REQUIRED_COLUMNS.items():
+        match = None
+        for alias in aliases:
+            normalized_alias = _normalize_column(alias)
+            if normalized_alias in normalized:
+                match = normalized[normalized_alias]
+                break
+        if match is None:
+            missing.append(required)
+        else:
+            resolved[required] = match
+
     if missing:
         raise SafetyTrendError("Missing required columns: " + ", ".join(missing))
+
+    return resolved
 
 
 def load_observations(path: str) -> list[SafetyObservation]:
@@ -54,35 +78,35 @@ def load_observations(path: str) -> list[SafetyObservation]:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
             raise SafetyTrendError("CSV file is missing a header row.")
-        _validate_columns(reader.fieldnames)
+        column_map = _resolve_columns(reader.fieldnames)
 
         observations: list[SafetyObservation] = []
         for row in reader:
-            severity = row["severity"].strip().upper()
+            severity = row[column_map["severity"]].strip().upper()
             if severity not in VALID_SEVERITIES:
                 raise SafetyTrendError(
-                    f"Invalid severity '{row['severity']}' in {row['obs_id']}"
+                    f"Invalid severity '{row[column_map['severity']]}' in {row[column_map['obs_id']]}"
                 )
-            near_miss_value = row["near_miss"].strip().upper()
+            near_miss_value = row[column_map["near_miss"]].strip().upper()
             if near_miss_value not in VALID_NEAR_MISS:
                 raise SafetyTrendError(
-                    f"Invalid near_miss '{row['near_miss']}' in {row['obs_id']}"
+                    f"Invalid near_miss '{row[column_map['near_miss']]}' in {row[column_map['obs_id']]}"
                 )
 
-            closed_date_raw = row["closed_date"].strip()
+            closed_date_raw = row[column_map["closed_date"]].strip()
             closed_date_value = date.fromisoformat(closed_date_raw) if closed_date_raw else None
 
             observations.append(
                 SafetyObservation(
-                    obs_id=row["obs_id"].strip(),
-                    date=date.fromisoformat(row["date"].strip()),
-                    area=row["area"].strip(),
-                    category=row["category"].strip(),
+                    obs_id=row[column_map["obs_id"]].strip(),
+                    date=date.fromisoformat(row[column_map["date"]].strip()),
+                    area=row[column_map["area"]].strip(),
+                    category=row[column_map["category"]].strip(),
                     severity=severity,
                     near_miss=near_miss_value == "TRUE",
-                    corrective_action=row["corrective_action"].strip(),
+                    corrective_action=row[column_map["corrective_action"]].strip(),
                     closed_date=closed_date_value,
-                    notes=row["notes"].strip(),
+                    notes=row[column_map["notes"]].strip(),
                 )
             )
 
