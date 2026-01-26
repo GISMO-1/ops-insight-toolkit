@@ -1,11 +1,17 @@
 """Unified runner for MOIT tools."""
-
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+
+# Allow running as a script from repo root: `python tools/run.py ...`
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
 def _add_common_csv_arg(parser: argparse.ArgumentParser) -> None:
