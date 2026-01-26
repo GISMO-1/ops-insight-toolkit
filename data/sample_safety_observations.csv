@@ -1,0 +1,96 @@
+obs_id,date,area,category,severity,near_miss,corrective_action,closed_date,notes
+OBS-0001,2026-02-14,Packaging,Housekeeping,MED,FALSE,Updated visual cue at station,2026-02-23,Observed during routine walk.
+OBS-0002,2026-02-11,Maintenance,Housekeeping,LOW,FALSE,Adjusted material staging,2026-02-20,Reported by line lead.
+OBS-0003,2026-02-19,QA,PPE,LOW,FALSE,Coached operator on standard work,,Reported by line lead.
+OBS-0004,2026-02-18,Maintenance,Ergonomics,LOW,FALSE,Scheduled maintenance follow-up,2026-02-25,Observed during routine walk.
+OBS-0005,2026-01-27,Warehouse,Chemical Handling,LOW,TRUE,Reinforced PPE requirements,2026-02-03,Observed during routine walk.
+OBS-0006,2026-02-09,Warehouse,Forklift,MED,FALSE,Adjusted material staging,2026-02-11,Observed during routine walk.
+OBS-0007,2026-02-16,Assembly,Ergonomics,HIGH,FALSE,Coached operator on standard work,2026-02-24,Follow-up needed after shift.
+OBS-0008,2026-01-15,Warehouse,Ergonomics,LOW,FALSE,Logged for safety committee review,2026-01-25,Reported by line lead.
+OBS-0009,2026-02-08,Assembly,Guarding,LOW,FALSE,Logged for safety committee review,2026-02-12,Follow-up needed after shift.
+OBS-0010,2026-02-27,Packaging,Guarding,MED,FALSE,Reinforced PPE requirements,2026-03-03,Flagged for next Gemba walk.
+OBS-0011,2026-02-19,Warehouse,Guarding,MED,FALSE,Logged for safety committee review,2026-02-24,Reported by line lead.
+OBS-0012,2026-01-20,QA,Chemical Handling,LOW,FALSE,Adjusted material staging,2026-01-24,Reported by line lead.
+OBS-0013,2026-02-06,Maintenance,Housekeeping,MED,FALSE,Updated visual cue at station,2026-02-13,Flagged for next Gemba walk.
+OBS-0014,2026-01-09,Maintenance,PPE,LOW,FALSE,Scheduled maintenance follow-up,,Observed during routine walk.
+OBS-0015,2026-02-17,Packaging,Forklift,MED,FALSE,Logged for safety committee review,2026-02-22,Area cleared and reset.
+OBS-0016,2026-01-15,Maintenance,Housekeeping,HIGH,FALSE,Scheduled maintenance follow-up,,Reported by line lead.
+OBS-0017,2026-02-06,Packaging,Forklift,LOW,FALSE,Adjusted material staging,2026-02-12,Reported by line lead.
+OBS-0018,2026-02-08,QA,Housekeeping,LOW,FALSE,Coached operator on standard work,,Follow-up needed after shift.
+OBS-0019,2026-01-20,Packaging,Guarding,MED,FALSE,Coached operator on standard work,2026-01-22,Flagged for next Gemba walk.
+OBS-0020,2026-02-23,Assembly,Guarding,MED,FALSE,Updated visual cue at station,2026-03-05,Area cleared and reset.
+OBS-0021,2026-01-18,QA,Forklift,MED,FALSE,Reinforced PPE requirements,,Follow-up needed after shift.
+OBS-0022,2026-02-02,QA,PPE,LOW,FALSE,Scheduled maintenance follow-up,2026-02-11,Reported by line lead.
+OBS-0023,2026-02-11,Assembly,Housekeeping,LOW,FALSE,Updated visual cue at station,2026-02-12,Follow-up needed after shift.
+OBS-0024,2026-01-09,QA,Guarding,LOW,FALSE,Adjusted material staging,2026-01-19,Flagged for next Gemba walk.
+OBS-0025,2026-02-04,Assembly,PPE,MED,TRUE,Coached operator on standard work,2026-02-10,Area cleared and reset.
+OBS-0026,2026-01-31,Maintenance,Forklift,LOW,FALSE,Logged for safety committee review,2026-02-07,Follow-up needed after shift.
+OBS-0027,2026-02-25,Packaging,Guarding,LOW,FALSE,Updated visual cue at station,2026-03-02,Area cleared and reset.
+OBS-0028,2026-01-20,Packaging,PPE,MED,FALSE,Coached operator on standard work,2026-01-29,Observed during routine walk.
+OBS-0029,2026-01-10,Assembly,Guarding,LOW,FALSE,Reinforced PPE requirements,,Reported by line lead.
+OBS-0030,2026-01-29,Packaging,PPE,LOW,FALSE,Reinforced PPE requirements,2026-02-07,Area cleared and reset.
+OBS-0031,2026-01-14,Assembly,Ergonomics,LOW,TRUE,Logged for safety committee review,2026-01-20,Observed during routine walk.
+OBS-0032,2026-01-08,QA,PPE,LOW,FALSE,Updated visual cue at station,2026-01-17,Observed during routine walk.
+OBS-0033,2026-02-28,Assembly,Housekeeping,LOW,FALSE,Updated visual cue at station,2026-03-10,Reported by line lead.
+OBS-0034,2026-02-11,QA,Housekeeping,MED,FALSE,Adjusted material staging,2026-02-17,Follow-up needed after shift.
+OBS-0035,2026-01-18,Warehouse,Guarding,LOW,TRUE,Logged for safety committee review,2026-01-24,Observed during routine walk.
+OBS-0036,2026-01-05,Maintenance,Chemical Handling,HIGH,FALSE,Coached operator on standard work,2026-01-14,Follow-up needed after shift.
+OBS-0037,2026-01-13,Warehouse,Housekeeping,MED,FALSE,Updated visual cue at station,2026-01-22,Follow-up needed after shift.
+OBS-0038,2026-02-13,QA,Housekeeping,MED,FALSE,Logged for safety committee review,2026-02-16,Follow-up needed after shift.
+OBS-0039,2026-01-12,Packaging,Forklift,LOW,FALSE,Adjusted material staging,2026-01-18,Reported by line lead.
+OBS-0040,2026-02-17,Warehouse,Chemical Handling,LOW,FALSE,Coached operator on standard work,2026-02-24,Follow-up needed after shift.
+OBS-0041,2026-01-07,Packaging,Ergonomics,MED,FALSE,Scheduled maintenance follow-up,2026-01-15,Flagged for next Gemba walk.
+OBS-0042,2026-02-19,Maintenance,Chemical Handling,LOW,TRUE,Logged for safety committee review,,Flagged for next Gemba walk.
+OBS-0043,2026-01-07,Warehouse,Chemical Handling,LOW,FALSE,Coached operator on standard work,2026-01-08,Follow-up needed after shift.
+OBS-0044,2026-01-18,Assembly,Forklift,LOW,FALSE,Reinforced PPE requirements,,Reported by line lead.
+OBS-0045,2026-01-20,Assembly,Guarding,MED,TRUE,Logged for safety committee review,,Area cleared and reset.
+OBS-0046,2026-02-25,Assembly,Ergonomics,LOW,FALSE,Reinforced PPE requirements,,Area cleared and reset.
+OBS-0047,2026-01-19,Assembly,PPE,LOW,FALSE,Updated visual cue at station,2026-01-23,Area cleared and reset.
+OBS-0048,2026-01-26,Warehouse,Housekeeping,HIGH,FALSE,Logged for safety committee review,2026-02-04,Follow-up needed after shift.
+OBS-0049,2026-01-06,Packaging,Ergonomics,LOW,FALSE,Scheduled maintenance follow-up,2026-01-16,Area cleared and reset.
+OBS-0050,2026-01-27,Warehouse,PPE,MED,FALSE,Reinforced PPE requirements,,Reported by line lead.
+OBS-0051,2026-01-21,Packaging,Forklift,LOW,FALSE,Adjusted material staging,2026-01-25,Follow-up needed after shift.
+OBS-0052,2026-02-01,Packaging,Forklift,HIGH,FALSE,Logged for safety committee review,,Follow-up needed after shift.
+OBS-0053,2026-02-06,Warehouse,Forklift,LOW,FALSE,Scheduled maintenance follow-up,2026-02-10,Area cleared and reset.
+OBS-0054,2026-02-16,Maintenance,Forklift,MED,TRUE,Adjusted material staging,2026-02-25,Observed during routine walk.
+OBS-0055,2026-01-24,Warehouse,Guarding,LOW,FALSE,Logged for safety committee review,2026-02-01,Area cleared and reset.
+OBS-0056,2026-02-17,Assembly,Chemical Handling,LOW,FALSE,Logged for safety committee review,2026-02-19,Follow-up needed after shift.
+OBS-0057,2026-02-06,QA,Ergonomics,LOW,FALSE,Updated visual cue at station,2026-02-10,Reported by line lead.
+OBS-0058,2026-01-14,Packaging,Housekeeping,LOW,FALSE,Coached operator on standard work,2026-01-24,Reported by line lead.
+OBS-0059,2026-02-19,Maintenance,PPE,LOW,TRUE,Logged for safety committee review,2026-02-21,Area cleared and reset.
+OBS-0060,2026-01-19,Assembly,Forklift,LOW,TRUE,Updated visual cue at station,,Observed during routine walk.
+OBS-0061,2026-02-03,Assembly,PPE,MED,FALSE,Adjusted material staging,2026-02-11,Flagged for next Gemba walk.
+OBS-0062,2026-02-26,QA,PPE,MED,FALSE,Updated visual cue at station,2026-03-06,Area cleared and reset.
+OBS-0063,2026-01-21,Assembly,Forklift,LOW,FALSE,Reinforced PPE requirements,2026-01-26,Area cleared and reset.
+OBS-0064,2026-01-09,Warehouse,Guarding,LOW,FALSE,Adjusted material staging,2026-01-12,Reported by line lead.
+OBS-0065,2026-01-29,Assembly,Forklift,LOW,FALSE,Scheduled maintenance follow-up,2026-02-05,Observed during routine walk.
+OBS-0066,2026-01-18,Maintenance,PPE,HIGH,FALSE,Logged for safety committee review,2026-01-28,Area cleared and reset.
+OBS-0067,2026-02-04,Packaging,Ergonomics,LOW,FALSE,Reinforced PPE requirements,2026-02-13,Flagged for next Gemba walk.
+OBS-0068,2026-01-19,Maintenance,Guarding,LOW,FALSE,Reinforced PPE requirements,2026-01-26,Reported by line lead.
+OBS-0069,2026-02-27,Maintenance,Guarding,HIGH,FALSE,Reinforced PPE requirements,2026-02-28,Observed during routine walk.
+OBS-0070,2026-02-15,Maintenance,Guarding,MED,TRUE,Scheduled maintenance follow-up,2026-02-19,Area cleared and reset.
+OBS-0071,2026-01-25,Warehouse,PPE,LOW,FALSE,Reinforced PPE requirements,2026-01-27,Area cleared and reset.
+OBS-0072,2026-01-06,QA,Housekeeping,HIGH,FALSE,Logged for safety committee review,2026-01-07,Observed during routine walk.
+OBS-0073,2026-01-20,Assembly,Housekeeping,MED,FALSE,Reinforced PPE requirements,2026-01-30,Reported by line lead.
+OBS-0074,2026-02-03,Warehouse,Ergonomics,LOW,FALSE,Logged for safety committee review,2026-02-06,Follow-up needed after shift.
+OBS-0075,2026-01-11,QA,Housekeeping,HIGH,FALSE,Reinforced PPE requirements,2026-01-15,Observed during routine walk.
+OBS-0076,2026-02-11,Assembly,Housekeeping,MED,FALSE,Logged for safety committee review,2026-02-13,Flagged for next Gemba walk.
+OBS-0077,2026-02-24,Packaging,Ergonomics,LOW,FALSE,Coached operator on standard work,2026-03-02,Observed during routine walk.
+OBS-0078,2026-02-28,Maintenance,PPE,LOW,FALSE,Logged for safety committee review,,Area cleared and reset.
+OBS-0079,2026-02-19,Assembly,PPE,LOW,FALSE,Logged for safety committee review,2026-02-28,Area cleared and reset.
+OBS-0080,2026-02-03,Maintenance,Forklift,LOW,FALSE,Updated visual cue at station,,Observed during routine walk.
+OBS-0081,2026-01-22,Maintenance,Guarding,MED,FALSE,Logged for safety committee review,2026-01-23,Area cleared and reset.
+OBS-0082,2026-02-28,Warehouse,Guarding,LOW,FALSE,Scheduled maintenance follow-up,2026-03-10,Follow-up needed after shift.
+OBS-0083,2026-02-09,Packaging,Chemical Handling,HIGH,TRUE,Logged for safety committee review,2026-02-18,Reported by line lead.
+OBS-0084,2026-02-18,Maintenance,Forklift,MED,FALSE,Coached operator on standard work,2026-02-22,Area cleared and reset.
+OBS-0085,2026-02-18,Assembly,Ergonomics,MED,FALSE,Adjusted material staging,2026-02-25,Flagged for next Gemba walk.
+OBS-0086,2026-01-26,Warehouse,Forklift,LOW,FALSE,Updated visual cue at station,2026-01-30,Follow-up needed after shift.
+OBS-0087,2026-01-12,QA,Forklift,LOW,FALSE,Reinforced PPE requirements,2026-01-22,Flagged for next Gemba walk.
+OBS-0088,2026-02-12,Warehouse,Housekeeping,MED,FALSE,Scheduled maintenance follow-up,2026-02-13,Flagged for next Gemba walk.
+OBS-0089,2026-01-13,Warehouse,Housekeeping,HIGH,FALSE,Logged for safety committee review,,Area cleared and reset.
+OBS-0090,2026-01-11,Packaging,Chemical Handling,LOW,FALSE,Scheduled maintenance follow-up,2026-01-12,Follow-up needed after shift.
+OBS-0091,2026-03-01,Maintenance,Housekeeping,MED,FALSE,Coached operator on standard work,2026-03-02,Reported by line lead.
+OBS-0092,2026-01-14,QA,Ergonomics,LOW,FALSE,Adjusted material staging,,Flagged for next Gemba walk.
+OBS-0093,2026-02-12,QA,Guarding,MED,FALSE,Reinforced PPE requirements,2026-02-22,Area cleared and reset.
+OBS-0094,2026-01-24,QA,Chemical Handling,LOW,FALSE,Coached operator on standard work,,Reported by line lead.
+OBS-0095,2026-02-14,Assembly,Ergonomics,MED,TRUE,Updated visual cue at station,2026-02-17,Observed during routine walk.
