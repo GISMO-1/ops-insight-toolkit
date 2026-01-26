@@ -44,9 +44,7 @@ class DowntimeAnalyzerError(ValueError):
 def _validate_columns(fieldnames: Iterable[str]) -> None:
     missing = [column for column in REQUIRED_COLUMNS if column not in fieldnames]
     if missing:
-        raise DowntimeAnalyzerError(
-            "Missing required columns: " + ", ".join(missing)
-        )
+        raise DowntimeAnalyzerError("Missing required columns: " + ", ".join(missing))
 
 
 def load_events(path: str) -> List[DowntimeEvent]:
@@ -100,7 +98,8 @@ def compute_aggregations(events: Iterable[DowntimeEvent]) -> Dict[str, Dict[str,
         "by_cause": _accumulate(events_list, lambda event: event.cause),
         "by_equipment": _accumulate(events_list, lambda event: event.equipment),
         "by_shift": _accumulate(events_list, lambda event: event.shift),
-        "by_hour": _accumulate(events_list, lambda event: str(event.start_time.hour)),
+        # IMPORTANT: store hour as an int so sorting is numeric (0..23), not string ("1","10","2"...)
+        "by_hour": _accumulate(events_list, lambda event: event.start_time.hour),
     }
 
 
@@ -125,7 +124,9 @@ def render_report(events: Iterable[DowntimeEvent]) -> str:
     aggregations = compute_aggregations(events_list)
 
     report_lines: List[str] = []
-    report_lines.extend(_format_ranked("Top causes by downtime minutes:", aggregations["by_cause"], total_minutes))
+    report_lines.extend(
+        _format_ranked("Top causes by downtime minutes:", aggregations["by_cause"], total_minutes)
+    )
     report_lines.append("")
     report_lines.extend(
         _format_ranked("Top equipment by downtime minutes:", aggregations["by_equipment"], total_minutes)
@@ -133,9 +134,7 @@ def render_report(events: Iterable[DowntimeEvent]) -> str:
     report_lines.append("")
     report_lines.extend(_format_simple("Downtime minutes by shift:", aggregations["by_shift"]))
     report_lines.append("")
-    report_lines.extend(
-        _format_simple("Hot hours (downtime minutes by hour):", aggregations["by_hour"])
-    )
+    report_lines.extend(_format_simple("Hot hours (downtime minutes by hour):", aggregations["by_hour"]))
     return "\n".join(report_lines)
 
 
