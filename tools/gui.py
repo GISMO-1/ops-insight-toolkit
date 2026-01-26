@@ -37,6 +37,7 @@ class MOITGui(tk.Tk):
         self.minsize(900, 600)
 
         self.tool_var = tk.StringVar(value="downtime")
+        self.last_run_output = ""
 
         # Common file inputs
         self.csv_path_var = tk.StringVar(value=os.path.join("data", "sample_downtime.csv"))
@@ -55,6 +56,12 @@ class MOITGui(tk.Tk):
         self._refresh_visible_inputs()
 
     def _build_ui(self) -> None:
+        menubar = tk.Menu(self)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        self.config(menu=menubar)
+
         # Top frame: tool selection
         top = ttk.Frame(self, padding=12)
         top.pack(side=tk.TOP, fill=tk.X)
@@ -133,7 +140,13 @@ class MOITGui(tk.Tk):
         status_frame = ttk.Frame(self, padding=(12, 0, 12, 12))
         status_frame.pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
+        self._status_style = ttk.Style(self)
+        self._status_style.configure("Status.Ready.TLabel", foreground="#6b7280")
+        self._status_style.configure("Status.Running.TLabel", foreground="#2563eb")
+        self._status_style.configure("Status.Complete.TLabel", foreground="#16a34a")
+        self._status_style.configure("Status.Error.TLabel", foreground="#dc2626")
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, style="Status.Ready.TLabel")
+        self.status_label.pack(side=tk.LEFT)
 
     def _refresh_visible_inputs(self) -> None:
         # Hide all input sections first
@@ -178,9 +191,18 @@ class MOITGui(tk.Tk):
 
     def _clear_output(self) -> None:
         self.output_text.delete("1.0", tk.END)
+        self.last_run_output = ""
+        self._set_status("Ready", state="ready")
 
-    def _set_status(self, text: str) -> None:
+    def _set_status(self, text: str, state: str = "ready") -> None:
         self.status_var.set(text)
+        style_map = {
+            "ready": "Status.Ready.TLabel",
+            "running": "Status.Running.TLabel",
+            "complete": "Status.Complete.TLabel",
+            "error": "Status.Error.TLabel",
+        }
+        self.status_label.configure(style=style_map.get(state, "Status.Ready.TLabel"))
         self.update_idletasks()
 
     def _append_output(self, text: str) -> None:
@@ -188,15 +210,15 @@ class MOITGui(tk.Tk):
         self.output_text.see(tk.END)
 
     def _save_output(self) -> None:
-        output = self.output_text.get("1.0", tk.END).strip()
+        output = self.last_run_output.strip()
         if not output:
             messagebox.showwarning("No output", "Run a tool to generate output before saving.")
-            self._set_status("Error: No output to save")
+            self._set_status("Error: No output to save", state="error")
             return
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         tool = self.tool_var.get()
-        initial_name = f"{tool}_report_{timestamp}.txt"
+        initial_name = f"{tool}_results_{timestamp}.txt"
 
         path = filedialog.asksaveasfilename(
             title="Save results",
@@ -206,7 +228,7 @@ class MOITGui(tk.Tk):
             initialdir=REPO_ROOT,
         )
         if not path:
-            self._set_status("Save canceled")
+            self._set_status("Ready", state="ready")
             return
 
         try:
@@ -214,17 +236,70 @@ class MOITGui(tk.Tk):
                 handle.write(output + "\n")
         except OSError as exc:
             messagebox.showerror("Save failed", f"Could not save results:\n{exc}")
-            self._set_status("Error: Save failed")
+            self._set_status("Error: Save failed", state="error")
             return
 
-        self._set_status(f"Saved results to {self._rel_or_abs(path)}")
+        self._set_status(f"Saved results to {self._rel_or_abs(path)}", state="complete")
+
+    def _show_about(self) -> None:
+        version = "1.1.0"
+        message = (
+            "Manufacturing Operations Insight Toolkit (MOIT)\n"
+            f"Version: {version}\n\n"
+            "MOIT provides offline, read-only analysis tools for downtime, throughput, "
+            "safety trends, and shift handoffs.\n\n"
+            "GitHub: https://github.com/placeholder/moit"
+        )
+        messagebox.showinfo("About MOIT", message)
 
     def _validate_required(self, value: str, label: str) -> bool:
         if not value.strip():
             messagebox.showwarning("Missing input", f"Please provide a value for {label}.")
-            self._set_status(f"Error: Missing {label}")
+            self._set_status(f"Error: Missing {label}", state="error")
             return False
         return True
+
+    def _resolve_path(self, path: str) -> str:
+        path = path.strip()
+        if not path:
+            return path
+        if os.path.isabs(path):
+            return path
+        return os.path.join(REPO_ROOT, path)
+
+    def _validate_file(self, path: str, label: str) -> bool:
+        if not self._validate_required(path, label):
+            return False
+        resolved = self._resolve_path(path)
+        if not os.path.isfile(resolved):
+            messagebox.showerror("Missing file", f"Could not find {label}:\n{path}")
+            self._set_status(f"Error: {label} not found", state="error")
+            return False
+        return True
+
+    def _validate_numeric_range(
+        self,
+        value: str,
+        label: str,
+        min_value: float,
+        max_value: float,
+    ) -> float | None:
+        if not self._validate_required(value, label):
+            return None
+        try:
+            numeric = float(value)
+        except ValueError:
+            messagebox.showerror("Invalid input", f"{label} must be numeric.")
+            self._set_status(f"Error: Invalid {label}", state="error")
+            return None
+        if not (min_value <= numeric <= max_value):
+            messagebox.showerror(
+                "Out of range",
+                f"{label} must be between {min_value:g} and {max_value:g}.",
+            )
+            self._set_status(f"Error: {label} out of range", state="error")
+            return None
+        return numeric
 
     def _run_selected(self) -> None:
         tool = self.tool_var.get()
@@ -233,46 +308,43 @@ class MOITGui(tk.Tk):
 
         if tool == "downtime":
             csv_path = self.csv_path_var.get()
-            if not self._validate_required(csv_path, "CSV file"):
+            if not self._validate_file(csv_path, "CSV file"):
                 return
             cmd += ["downtime", "--csv", csv_path.strip()]
         elif tool == "safety":
             csv_path = self.csv_path_var.get()
-            if not self._validate_required(csv_path, "CSV file"):
+            if not self._validate_file(csv_path, "CSV file"):
                 return
             cmd += ["safety", "--csv", csv_path.strip()]
         elif tool == "handoff-validate":
             handoff_path = self.handoff_path_var.get()
-            if not self._validate_required(handoff_path, "handoff file"):
+            if not self._validate_file(handoff_path, "handoff file"):
                 return
             cmd += ["handoff-validate", "--file", handoff_path.strip()]
         elif tool == "throughput":
-            try:
-                # Validate numeric inputs early so we can give a clean message
-                if not self._validate_required(self.nominal_rate_var.get(), "nominal rate"):
-                    return
-                if not self._validate_required(self.minor_stops_per_hour_var.get(), "minor stops per hour"):
-                    return
-                if not self._validate_required(self.avg_minor_stop_min_var.get(), "average minor stop minutes"):
-                    return
-                if not self._validate_required(self.changeovers_per_shift_var.get(), "changeovers per shift"):
-                    return
-                if not self._validate_required(self.changeover_min_var.get(), "changeover minutes"):
-                    return
-                if not self._validate_required(self.shift_length_hours_var.get(), "shift length hours"):
-                    return
-                if not self._validate_required(self.staffing_factor_var.get(), "staffing factor"):
-                    return
-                float(self.nominal_rate_var.get())
-                float(self.minor_stops_per_hour_var.get())
-                float(self.avg_minor_stop_min_var.get())
-                float(self.changeovers_per_shift_var.get())
-                float(self.changeover_min_var.get())
-                float(self.shift_length_hours_var.get())
-                float(self.staffing_factor_var.get())
-            except ValueError:
-                messagebox.showerror("Invalid input", "Throughput fields must be numeric.")
-                self._set_status("Error: Invalid numeric input")
+            nominal_rate = self._validate_numeric_range(self.nominal_rate_var.get(), "Nominal rate", 1, 10000)
+            minor_stops = self._validate_numeric_range(
+                self.minor_stops_per_hour_var.get(), "Minor stops per hour", 0, 60
+            )
+            avg_minor_stop = self._validate_numeric_range(
+                self.avg_minor_stop_min_var.get(), "Average minor stop minutes", 0, 60
+            )
+            changeovers = self._validate_numeric_range(
+                self.changeovers_per_shift_var.get(), "Changeovers per shift", 0, 20
+            )
+            changeover_min = self._validate_numeric_range(self.changeover_min_var.get(), "Changeover minutes", 0, 240)
+            shift_length = self._validate_numeric_range(self.shift_length_hours_var.get(), "Shift length hours", 1, 24)
+            staffing_factor = self._validate_numeric_range(self.staffing_factor_var.get(), "Staffing factor", 0.1, 5)
+
+            if None in (
+                nominal_rate,
+                minor_stops,
+                avg_minor_stop,
+                changeovers,
+                changeover_min,
+                shift_length,
+                staffing_factor,
+            ):
                 return
 
             cmd += [
@@ -296,10 +368,10 @@ class MOITGui(tk.Tk):
             cmd += ["test"]
         else:
             messagebox.showerror("Unknown tool", f"Unknown tool: {tool}")
-            self._set_status("Error: Unknown tool")
+            self._set_status("Error: Unknown tool", state="error")
             return
 
-        self._set_status("Running...")
+        self._set_status("Running analysis...", state="running")
         self._append_output(f"$ {' '.join(cmd)}\n\n")
 
         try:
@@ -311,22 +383,33 @@ class MOITGui(tk.Tk):
             )
         except Exception as exc:
             self._append_output(f"ERROR: failed to run command: {exc}\n")
-            self._set_status("Error: Failed to run command")
+            self._set_status(f"Error: {exc}", state="error")
             return
 
+        run_output_parts: list[str] = []
         if proc.stdout:
             self._append_output(proc.stdout)
+            run_output_parts.append(proc.stdout)
             if not proc.stdout.endswith("\n"):
                 self._append_output("\n")
+                run_output_parts.append("\n")
 
         if proc.stderr:
             self._append_output("\n[stderr]\n")
+            run_output_parts.append("\n[stderr]\n")
             self._append_output(proc.stderr)
+            run_output_parts.append(proc.stderr)
             if not proc.stderr.endswith("\n"):
                 self._append_output("\n")
+                run_output_parts.append("\n")
 
         self._append_output(f"\n(exit code: {proc.returncode})\n\n")
-        self._set_status("Complete" if proc.returncode == 0 else f"Error: Exit code {proc.returncode}")
+        run_output_parts.append(f"\n(exit code: {proc.returncode})\n")
+        self.last_run_output = "".join(run_output_parts).strip()
+        if proc.returncode == 0:
+            self._set_status("Analysis complete", state="complete")
+        else:
+            self._set_status(f"Error: Exit code {proc.returncode}", state="error")
 
 
 def main() -> None:
