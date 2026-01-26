@@ -82,11 +82,11 @@ No proprietary systems, processes, or confidential information are referenced or
 - [GUI Wrapper](docs/tool_gui.md)
 
 ## GUI Wrapper (Tkinter)
-**Purpose:** Provide a desktop interface for running MOIT CLI tools and viewing results in one window.  
-**Inputs:** Tool selection, CSV/Markdown files, and throughput parameters.  
-**Outputs:** Text results in the GUI output panel and optional exported `.txt`/`.csv` reports via **Save Results…**.  
+**Purpose:** Provide a desktop interface for running MOIT CLI tools, exporting reports, and guiding non-technical users through onboarding.  
+**Inputs:** Tool selection, CSV/Markdown files, throughput parameters, and a configurable output folder.  
+**Outputs:** Text results in the GUI output panel, exported `.txt`/`.csv` reports via **Save Results…**, status + last run time, and a Logs/Diagnostics view.  
 **Example command:** `python -m tools.gui`  
-**Self-check:** Run the Downtime tool with `data/sample_downtime.csv`, confirm output appears, and save a report file.  
+**Self-check:** Run the Downtime tool with `data/sample_downtime.csv`, confirm output appears, save a report file, and open the configured output folder from **Help → Open Output Folder**.  
 
 ## Packaging as a Standalone Executable
 See [Packaging MOIT as a Standalone Windows Executable](docs/packaging_moit_exe.md) for the PyInstaller command, bundled data notes, and validation checklist.  

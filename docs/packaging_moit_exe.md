@@ -19,12 +19,28 @@ py -3.11 -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name MOIT ^
   --add-data "data;data" ^
   --add-data "docs;docs" ^
+  --add-data "README.md;." ^
   tools/gui.py
 ```
 
 ## Notes
-- The `--add-data` flags bundle the `data/` and `docs/` directories so sample inputs and reference docs are available offline.
+- The `--add-data` flags bundle the `data/`, `docs/`, and `README.md` files so sample inputs and reference docs are available offline.
 - If you need a console window for troubleshooting, replace `--windowed` with `--console`.
+
+## Build with PyInstaller spec
+### Purpose
+Provide a reusable `.spec` file for consistent single-file packaging without custom icons.
+
+### Inputs
+- `tools/moit.spec`
+
+### Example command
+```bash
+py -3.11 -m PyInstaller --noconfirm --clean tools\\moit.spec
+```
+
+### Self-check
+- Confirm `dist/MOIT.exe` launches and the GUI can open the user guide.
 
 ## Validation checklist (clean Windows machine)
 1. Copy `dist/MOIT.exe` to a Windows system without Python.
