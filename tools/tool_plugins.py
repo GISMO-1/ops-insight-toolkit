@@ -2,7 +2,7 @@
 
 README
 Purpose: Load Python plugin files that expose a run_plugin(df) callable for additional analysis steps.
-Inputs/Outputs: Inputs are a plugins folder path and a pandas DataFrame; outputs plugin results or errors.
+Inputs/Outputs: Inputs are a plugins folder path and a data table; outputs plugin results or errors.
 Example command: python -m tools.tool_plugins --self-check
 Self-check: python -m tools.tool_plugins --self-check
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
 
-import pandas as pd
+from tools import optional_deps
 
 
 @dataclass
@@ -25,7 +25,14 @@ class PluginTool:
     name: str
     path: Path
     module: ModuleType
-    runner: Callable[[pd.DataFrame], Any]
+    runner: Callable[[Any], Any]
+    requires_pandas: bool = True
+
+
+@dataclass
+class PluginStatus:
+    enabled: bool
+    message: str
 
 
 def load_plugins(folder: str | Path) -> tuple[list[PluginTool], list[str]]:
@@ -52,11 +59,31 @@ def load_plugins(folder: str | Path) -> tuple[list[PluginTool], list[str]]:
         if not callable(runner):
             errors.append(f"{plugin_path.name}: missing run_plugin(df) function")
             continue
-        plugins.append(PluginTool(name=plugin_path.stem, path=plugin_path, module=module, runner=runner))
+        plugins.append(
+            PluginTool(
+                name=plugin_path.stem,
+                path=plugin_path,
+                module=module,
+                runner=runner,
+            )
+        )
     return plugins, errors
 
 
-def run_plugin_safe(plugin: PluginTool, df: pd.DataFrame) -> tuple[bool, Any, str]:
+def plugin_status() -> PluginStatus:
+    available = optional_deps.has_pandas()
+    if available:
+        return PluginStatus(enabled=True, message="Ready")
+    return PluginStatus(
+        enabled=False,
+        message="Requires pandas. Install optional dependencies to enable plugins.",
+    )
+
+
+def run_plugin_safe(plugin: PluginTool, df: Any) -> tuple[bool, Any, str]:
+    status = plugin_status()
+    if not status.enabled:
+        return False, None, status.message
     try:
         return True, plugin.runner(df), ""
     except Exception as exc:  # noqa: BLE001 - plugin errors should not crash GUI
@@ -69,7 +96,7 @@ def self_check() -> tuple[bool, str]:
         tmp_dir.mkdir(exist_ok=True)
         plugin_path = tmp_dir / "sample_plugin.py"
         plugin_path.write_text(
-            "def run_plugin(df):\n    return df.head(1)\n",
+            "def run_plugin(df):\n    return df\n",
             encoding="utf-8",
         )
         plugins, errors = load_plugins(tmp_dir)
@@ -77,9 +104,14 @@ def self_check() -> tuple[bool, str]:
             return False, f"Unexpected plugin errors: {errors}"
         if not plugins:
             return False, "Plugin load failed."
-        result_ok, result, _ = run_plugin_safe(plugins[0], pd.DataFrame({"A": [1, 2]}))
-        if not result_ok or result is None:
-            return False, "Plugin runner failed."
+        status = plugin_status()
+        if not status.enabled:
+            return True, f"Plugin load ok; {status.message}"
+        ok, result, error = run_plugin_safe(plugins[0], {"sample": 1})
+        if not ok:
+            return False, f"Plugin runner failed: {error}"
+        if result is None:
+            return False, "Plugin runner returned no result."
         return True, "Tool plugins self-check passed."
     finally:
         if tmp_dir.exists():

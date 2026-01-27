@@ -1,48 +1,37 @@
 import unittest
 
-import importlib.util
-
-PANDAS_AVAILABLE = importlib.util.find_spec("pandas") is not None
-if PANDAS_AVAILABLE:
-    from tools import tool_builder
-else:
-    tool_builder = None
+from tools import csv_engine, tool_builder
 
 
 class ToolBuilderTests(unittest.TestCase):
-    @unittest.skipUnless(PANDAS_AVAILABLE, "pandas is required for Tool Builder tests")
     def test_self_check(self) -> None:
-        assert tool_builder is not None
         ok, message = tool_builder.self_check()
         self.assertTrue(ok, message)
 
-    @unittest.skipUnless(PANDAS_AVAILABLE, "pandas is required for Tool Builder tests")
-    def test_count_grouped(self) -> None:
-        import pandas as pd
-
-        assert tool_builder is not None
-        df = pd.DataFrame(
-            {
-                "Shift": ["A", "A", "B"],
-                "Duration": [5, 7, 3],
-                "Reason": ["Jam", "Reset", "Jam"],
-            }
-        )
-        result = tool_builder.perform_operation(df, ["Duration"], ["Shift"], "COUNT")
-        self.assertEqual(result.loc["A", "Duration"], 2)
-        self.assertEqual(result.loc["B", "Duration"], 1)
-
-    @unittest.skipUnless(PANDAS_AVAILABLE, "pandas is required for Tool Builder tests")
     def test_filter_contains(self) -> None:
-        import pandas as pd
-
-        assert tool_builder is not None
-        df = pd.DataFrame({"Reason": ["Jam", "Reset", "Jam"]})
+        data = csv_engine.CSVTable(
+            columns=["Reason"],
+            rows=[{"Reason": "Jam"}, {"Reason": "Reset"}, {"Reason": "Jam"}],
+        )
         filtered = tool_builder.apply_filters(
-            df,
+            data,
             [tool_builder.FilterRule("Reason", "contains", "jam")],
         )
-        self.assertEqual(len(filtered), 2)
+        self.assertEqual(len(filtered.rows), 2)
+
+    def test_count_grouped_baseline(self) -> None:
+        data = csv_engine.CSVTable(
+            columns=["Shift", "Duration"],
+            rows=[
+                {"Shift": "A", "Duration": "5"},
+                {"Shift": "A", "Duration": "7"},
+                {"Shift": "B", "Duration": "3"},
+            ],
+        )
+        result = tool_builder.perform_operation(data, ["Duration"], ["Shift"], "COUNT")
+        counts = {row["Shift"]: row["COUNT_Duration"] for row in result.rows}
+        self.assertEqual(counts.get("A"), "2")
+        self.assertEqual(counts.get("B"), "1")
 
 
 if __name__ == "__main__":

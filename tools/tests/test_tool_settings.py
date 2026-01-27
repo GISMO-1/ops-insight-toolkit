@@ -14,6 +14,7 @@ class ToolSettingsTests(unittest.TestCase):
             silent_csv_reload=True,
             auto_reload_plugins=False,
             check_updates_on_launch=True,
+            safe_mode=True,
             csv_poll_interval=7.5,
         )
         with tempfile.TemporaryDirectory() as tmpdir:

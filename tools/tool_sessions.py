@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
+from tools import csv_engine, optional_deps
 
 
 CHART_SORT_OPTIONS = ("Original", "Ascending", "Descending")
@@ -64,19 +64,33 @@ class ChartConfig:
         )
 
 
-def serialize_last_result(result: pd.DataFrame | str | None) -> dict[str, Any]:
+def _pandas_dataframe(value: Any) -> bool:
+    ok, pd_module, _ = optional_deps.try_import_pandas()
+    if not ok or pd_module is None:
+        return False
+    return isinstance(value, pd_module.DataFrame)
+
+
+def serialize_last_result(result: Any) -> dict[str, Any]:
     if result is None:
         return {"type": "none", "value": None}
-    if isinstance(result, pd.DataFrame):
+    if _pandas_dataframe(result):
         return {"type": "dataframe", "value": result.to_dict(orient="split")}
+    if isinstance(result, csv_engine.CSVTable):
+        return {"type": "csv_table", "value": result.to_dict()}
     return {"type": "text", "value": str(result)}
 
 
-def deserialize_last_result(payload: dict[str, Any]) -> pd.DataFrame | str | None:
+def deserialize_last_result(payload: dict[str, Any]) -> Any:
     result_type = payload.get("type", "none")
     value = payload.get("value")
     if result_type == "dataframe" and isinstance(value, dict):
-        return pd.DataFrame(**value)
+        ok, pd_module, _ = optional_deps.try_import_pandas()
+        if ok and pd_module is not None:
+            return pd_module.DataFrame(**value)
+        return None
+    if result_type == "csv_table" and isinstance(value, dict):
+        return csv_engine.CSVTable.from_dict(value)
     if result_type == "text":
         return "" if value is None else str(value)
     return None
@@ -92,7 +106,7 @@ def build_session_payload(
     operation: str,
     filter_data: dict[str, str],
     chart_config: ChartConfig,
-    last_result: pd.DataFrame | str | None,
+    last_result: Any,
 ) -> dict[str, Any]:
     return {
         "csv_paths": csv_paths,
@@ -120,7 +134,6 @@ def default_session_path() -> Path:
 
 
 def self_check() -> tuple[bool, str]:
-    sample_df = pd.DataFrame({"Region": ["North", "South"], "Value": [10, 20]})
     config = ChartConfig(title="Sample")
     payload = build_session_payload(
         csv_paths=["sample.csv"],
@@ -131,13 +144,16 @@ def self_check() -> tuple[bool, str]:
         operation="SUM",
         filter_data={"column": "", "operator": "=", "value": ""},
         chart_config=config,
-        last_result=sample_df,
+        last_result=csv_engine.CSVTable(
+            columns=["Region", "Value"],
+            rows=[{"Region": "North", "Value": "10"}],
+        ),
     )
     parsed_config = ChartConfig.from_dict(payload.get("chart_config"))
     if parsed_config.title != "Sample":
         return False, "ChartConfig round-trip failed."
     restored = deserialize_last_result(payload.get("last_result", {}))
-    if not isinstance(restored, pd.DataFrame):
+    if not isinstance(restored, csv_engine.CSVTable):
         return False, "Result deserialize failed."
     return True, "Tool sessions self-check passed."
 
