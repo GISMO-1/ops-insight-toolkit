@@ -1,9 +1,10 @@
 """Tool Builder Wizard: build simple CSV analyses without coding.
 
 README
-Purpose: Provide a GUI wizard for loading CSV files and running common analysis steps.
-Inputs/Outputs: CSV input path; outputs results in the GUI and can export to CSV/TXT.
-Example command: python tools/tool_builder.py
+Purpose: Provide a GUI wizard for loading one or more CSV files, merging them, and running common analysis steps.
+Inputs/Outputs: CSV input path(s), optional merge settings, and recipe batch options; outputs results in the GUI,
+chart previews, and can export to CSV/TXT.
+Example command: python tools/tool_builder.py data/sample.csv
 Self-check: python tools/tool_builder.py --self-check
 """
 
@@ -12,13 +13,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 
 OPERATIONS = [
@@ -34,6 +36,10 @@ OPERATIONS = [
 ]
 
 FILTER_OPERATORS = ["=", "!=", ">", ">=", "<", "<=", "contains"]
+MERGE_MODES = ["Single file", "Stack (concat)", "Side-by-side (join)"]
+NUMERIC_OPERATIONS = {"SUM", "AVERAGE", "MAX", "MIN", "OUTLIER DETECTION", "TREND"}
+CHART_TYPES = ["Bar", "Line", "Pie"]
+THEME_MODES = ["Default", "Dark", "Large Fonts", "Compact"]
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,34 @@ def load_dataframe(csv_path: str | Path) -> pd.DataFrame:
     return df
 
 
+def merge_dataframes(paths: list[str], mode: str, join_key: str | None) -> pd.DataFrame:
+    if not paths:
+        raise ValueError("Select at least one CSV file.")
+    dataframes = [load_dataframe(path) for path in paths]
+    if mode == "Single file":
+        if len(dataframes) > 1:
+            raise ValueError("Single file mode supports one CSV. Choose a merge mode for multiple files.")
+        return dataframes[0]
+    if mode == "Stack (concat)":
+        return pd.concat(dataframes, ignore_index=True, sort=False)
+    if mode == "Side-by-side (join)":
+        if not join_key:
+            raise ValueError("Provide a join key column for side-by-side merges.")
+        merged: pd.DataFrame | None = None
+        for path, df in zip(paths, dataframes):
+            if join_key not in df.columns:
+                raise ValueError(f"Join key '{join_key}' not found in {path}.")
+            prefix = Path(path).stem
+            renamed = df.rename(
+                columns={col: f"{prefix}_{col}" for col in df.columns if col != join_key},
+            )
+            merged = renamed if merged is None else pd.merge(merged, renamed, on=join_key, how="outer")
+        if merged is None:
+            raise ValueError("No data available to merge.")
+        return merged
+    raise ValueError(f"Unsupported merge mode: {mode}")
+
+
 def preview_dataframe(df: pd.DataFrame, rows: int = 8) -> str:
     return df.head(rows).to_string(index=False)
 
@@ -135,6 +169,31 @@ def _coerce_numeric(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
         joined = ", ".join(non_numeric)
         raise ValueError(f"Selected columns are not numeric: {joined}")
     return numeric_df
+
+
+def _columns_missing_numeric_values(df: pd.DataFrame, columns: list[str]) -> list[str]:
+    numeric_df = df[columns].apply(pd.to_numeric, errors="coerce")
+    return [col for col in columns if numeric_df[col].notna().sum() == 0]
+
+
+def suggest_columns(df: pd.DataFrame) -> dict[str, Any]:
+    row_count = len(df)
+    suggestions: dict[str, Any] = {"group_by": [], "numeric": [], "top_patterns": {}}
+    if row_count == 0:
+        return suggestions
+    numeric_columns = df.select_dtypes(include="number").columns.tolist()
+    suggestions["numeric"] = numeric_columns
+    candidate_columns = []
+    for column in df.columns:
+        unique_count = df[column].nunique(dropna=True)
+        if 1 < unique_count <= min(12, max(2, row_count // 2)):
+            candidate_columns.append(column)
+    suggestions["group_by"] = candidate_columns
+    if candidate_columns:
+        target = candidate_columns[0]
+        top_values = df[target].astype(str).value_counts(dropna=False).head(5)
+        suggestions["top_patterns"] = {target: top_values.to_dict()}
+    return suggestions
 
 
 def _trend_slope(series: pd.Series) -> float:
@@ -253,17 +312,25 @@ class ToolBuilderApp(tk.Tk):
         self.geometry("1050x750")
         self.df: pd.DataFrame | None = None
         self.last_result: pd.DataFrame | str | None = None
+        self.csv_paths: list[str] = []
 
         self.csv_path_var = tk.StringVar(value=initial_csv or "")
         self.operation_var = tk.StringVar(value=OPERATIONS[0])
         self.filter_column_var = tk.StringVar()
         self.filter_operator_var = tk.StringVar(value=FILTER_OPERATORS[0])
         self.filter_value_var = tk.StringVar()
+        self.merge_mode_var = tk.StringVar(value=MERGE_MODES[0])
+        self.merge_key_var = tk.StringVar()
+        self.chart_type_var = tk.StringVar(value=CHART_TYPES[0])
+        self.chart_column_var = tk.StringVar()
+        self.theme_var = tk.StringVar(value=THEME_MODES[0])
         self.status_var = tk.StringVar(value="Load a CSV to begin.")
+        self.warning_var = tk.StringVar(value="")
+        self._base_font_size = tkfont.nametofont("TkDefaultFont").actual()["size"]
 
         self._build_layout()
         if initial_csv:
-            self._load_csv(initial_csv)
+            self._load_csv([initial_csv])
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -272,6 +339,17 @@ class ToolBuilderApp(tk.Tk):
         header.grid(row=0, column=0, sticky="w", padx=16, pady=(16, 4))
         subtitle = ttk.Label(self, text="Build quick CSV analyses using simple form inputs.")
         subtitle.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+        theme_frame = ttk.Frame(self)
+        theme_frame.grid(row=0, column=0, sticky="e", padx=16, pady=(16, 4))
+        ttk.Label(theme_frame, text="Theme:").grid(row=0, column=0, sticky="e", padx=(0, 6))
+        theme_combo = ttk.Combobox(
+            theme_frame,
+            textvariable=self.theme_var,
+            values=THEME_MODES,
+            state="readonly",
+            width=14,
+        )
+        theme_combo.grid(row=0, column=1, sticky="e")
 
         file_frame = ttk.LabelFrame(self, text="1) Load CSV File")
         file_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=6)
@@ -282,8 +360,22 @@ class ToolBuilderApp(tk.Tk):
         csv_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=8)
         browse_btn = ttk.Button(file_frame, text="Browse", command=self._browse_csv)
         browse_btn.grid(row=0, column=2, sticky="ew", padx=8, pady=8)
+        browse_multi_btn = ttk.Button(file_frame, text="Browse Multiple", command=self._browse_csvs)
+        browse_multi_btn.grid(row=0, column=3, sticky="ew", padx=8, pady=8)
         load_btn = ttk.Button(file_frame, text="Load", command=self._load_csv_from_entry)
-        load_btn.grid(row=0, column=3, sticky="ew", padx=8, pady=8)
+        load_btn.grid(row=0, column=4, sticky="ew", padx=8, pady=8)
+
+        ttk.Label(file_frame, text="Merge Mode:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        merge_mode_combo = ttk.Combobox(
+            file_frame,
+            textvariable=self.merge_mode_var,
+            values=MERGE_MODES,
+            state="readonly",
+        )
+        merge_mode_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Label(file_frame, text="Join Key:").grid(row=1, column=2, sticky="w", padx=8, pady=6)
+        join_key_entry = ttk.Entry(file_frame, textvariable=self.merge_key_var)
+        join_key_entry.grid(row=1, column=3, sticky="ew", padx=8, pady=6)
 
         preview_frame = ttk.LabelFrame(self, text="2) Preview Data")
         preview_frame.grid(row=3, column=0, sticky="nsew", padx=16, pady=6)
@@ -340,31 +432,74 @@ class ToolBuilderApp(tk.Tk):
         run_btn.grid(row=0, column=0, sticky="w", padx=4)
         save_btn = ttk.Button(action_frame, text="Save Results", command=self._save_results)
         save_btn.grid(row=0, column=1, sticky="w", padx=4)
+        copy_btn = ttk.Button(action_frame, text="Copy Results", command=self._copy_results)
+        copy_btn.grid(row=0, column=2, sticky="w", padx=4)
+        suggest_btn = ttk.Button(action_frame, text="Smart Suggest", command=self._smart_suggest)
+        suggest_btn.grid(row=0, column=3, sticky="w", padx=4)
         recipe_save_btn = ttk.Button(action_frame, text="Save Recipe", command=self._save_recipe)
-        recipe_save_btn.grid(row=0, column=2, sticky="w", padx=4)
+        recipe_save_btn.grid(row=0, column=4, sticky="w", padx=4)
         recipe_load_btn = ttk.Button(action_frame, text="Load Recipe", command=self._load_recipe)
-        recipe_load_btn.grid(row=0, column=3, sticky="w", padx=4)
+        recipe_load_btn.grid(row=0, column=5, sticky="w", padx=4)
+        batch_btn = ttk.Button(action_frame, text="Run Recipe Batch", command=self._run_recipe_batch)
+        batch_btn.grid(row=0, column=6, sticky="w", padx=4)
         clear_btn = ttk.Button(action_frame, text="Clear Results", command=self._clear_results)
-        clear_btn.grid(row=0, column=4, sticky="w", padx=4)
+        clear_btn.grid(row=0, column=7, sticky="w", padx=4)
 
         result_frame = ttk.LabelFrame(self, text="4) Results")
         result_frame.grid(row=7, column=0, sticky="nsew", padx=16, pady=6)
         result_frame.columnconfigure(0, weight=1)
         result_frame.rowconfigure(0, weight=1)
+        results_notebook = ttk.Notebook(result_frame)
+        results_notebook.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        result_frame.rowconfigure(0, weight=1)
 
-        self.results_text = tk.Text(result_frame, wrap="none")
-        results_scroll = ttk.Scrollbar(result_frame, command=self.results_text.yview)
+        table_frame = ttk.Frame(results_notebook)
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        self.results_text = tk.Text(table_frame, wrap="none")
+        results_scroll = ttk.Scrollbar(table_frame, command=self.results_text.yview)
         self.results_text.configure(yscrollcommand=results_scroll.set)
-        self.results_text.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
-        results_scroll.grid(row=0, column=1, sticky="ns", pady=8)
+        self.results_text.grid(row=0, column=0, sticky="nsew")
+        results_scroll.grid(row=0, column=1, sticky="ns")
+
+        chart_frame = ttk.Frame(results_notebook)
+        chart_controls = ttk.Frame(chart_frame)
+        chart_controls.pack(anchor="w", pady=(0, 8))
+        ttk.Label(chart_controls, text="Chart Type:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        chart_type_combo = ttk.Combobox(
+            chart_controls,
+            textvariable=self.chart_type_var,
+            values=CHART_TYPES,
+            state="readonly",
+            width=10,
+        )
+        chart_type_combo.grid(row=0, column=1, sticky="w")
+        ttk.Label(chart_controls, text="Value Column:").grid(row=0, column=2, sticky="w", padx=(12, 6))
+        self.chart_column_combo = ttk.Combobox(
+            chart_controls,
+            textvariable=self.chart_column_var,
+            state="readonly",
+            width=18,
+        )
+        self.chart_column_combo.grid(row=0, column=3, sticky="w")
+        self.chart_canvas = tk.Canvas(chart_frame, height=320, background="white")
+        self.chart_canvas.pack(fill="both", expand=True)
+
+        results_notebook.add(table_frame, text="Table")
+        results_notebook.add(chart_frame, text="Chart Preview")
 
         status_frame = ttk.Frame(self)
         status_frame.grid(row=8, column=0, sticky="ew", padx=16, pady=(4, 12))
         status_label = ttk.Label(status_frame, textvariable=self.status_var)
         status_label.pack(anchor="w")
+        warning_label = tk.Label(status_frame, textvariable=self.warning_var, fg="#b54700")
+        warning_label.pack(anchor="w")
 
         Tooltip(browse_btn, "Browse for a CSV file.")
+        Tooltip(browse_multi_btn, "Browse and select multiple CSV files.")
         Tooltip(load_btn, "Load the selected CSV file.")
+        Tooltip(merge_mode_combo, "Pick how to combine multiple files.")
+        Tooltip(join_key_entry, "Column name to join on when merging side-by-side.")
         Tooltip(self.column_listbox, "Choose one or more columns to analyze.")
         Tooltip(self.group_listbox, "Optional: group results by these columns.")
         Tooltip(operation_combo, "Select the analysis operation to run.")
@@ -373,35 +508,74 @@ class ToolBuilderApp(tk.Tk):
         Tooltip(value_entry, "Value to compare against the filter column.")
         Tooltip(run_btn, "Run the configured analysis.")
         Tooltip(save_btn, "Save results to CSV or TXT.")
+        Tooltip(copy_btn, "Copy results to clipboard for Excel/email.")
+        Tooltip(suggest_btn, "Suggest useful groupings and highlight frequent values.")
         Tooltip(recipe_save_btn, "Save current configuration as a recipe JSON.")
         Tooltip(recipe_load_btn, "Load a saved recipe JSON.")
+        Tooltip(batch_btn, "Run a recipe across a folder of CSVs.")
+        Tooltip(theme_combo, "Switch theme and typography modes.")
+        Tooltip(chart_type_combo, "Pick a chart type for preview.")
+        Tooltip(self.chart_column_combo, "Choose which column to chart.")
 
         self.rowconfigure(7, weight=1)
+
+        self.column_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
+        self.group_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
+        operation_combo.bind("<<ComboboxSelected>>", lambda _event: self._validate_inputs())
+        self.filter_column_combo.bind("<<ComboboxSelected>>", lambda _event: self._validate_inputs())
+        operator_combo.bind("<<ComboboxSelected>>", lambda _event: self._validate_inputs())
+        self.merge_mode_var.trace_add("write", lambda *_args: self._validate_inputs())
+        self.merge_key_var.trace_add("write", lambda *_args: self._validate_inputs())
+        self.filter_value_var.trace_add("write", lambda *_args: self._validate_inputs())
+        self.csv_path_var.trace_add("write", lambda *_args: self._validate_inputs())
+        self.chart_type_var.trace_add("write", lambda *_args: self._render_chart())
+        self.chart_column_var.trace_add("write", lambda *_args: self._render_chart())
+        self.theme_var.trace_add("write", lambda *_args: self._apply_theme())
+        self._apply_theme()
 
     def _browse_csv(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
         if path:
             self.csv_path_var.set(path)
+            self.csv_paths = [path]
+
+    def _browse_csvs(self) -> None:
+        paths = filedialog.askopenfilenames(filetypes=[("CSV Files", "*.csv")])
+        if paths:
+            self.csv_paths = list(paths)
+            self.csv_path_var.set("; ".join(paths))
+            if len(paths) > 1 and self.merge_mode_var.get() == "Single file":
+                self.merge_mode_var.set("Stack (concat)")
 
     def _load_csv_from_entry(self) -> None:
-        path = self.csv_path_var.get().strip()
-        if not path:
+        paths = self._resolve_csv_paths()
+        if not paths:
             messagebox.showwarning("Missing CSV", "Please choose a CSV file.")
             return
-        self._load_csv(path)
+        self._load_csv(paths)
 
-    def _load_csv(self, path: str) -> None:
+    def _load_csv(self, paths: list[str]) -> None:
         try:
-            self.df = load_dataframe(path)
+            self.df = merge_dataframes(paths, self.merge_mode_var.get(), self.merge_key_var.get().strip() or None)
         except (FileNotFoundError, ValueError) as exc:
             messagebox.showerror("CSV Load Error", str(exc))
             self.status_var.set(f"Error: {exc}")
             return
-        self.csv_path_var.set(path)
+        self.csv_path_var.set("; ".join(paths))
+        self.csv_paths = paths
         self.preview_text.delete("1.0", tk.END)
         self.preview_text.insert(tk.END, preview_dataframe(self.df))
         self._populate_columns()
         self.status_var.set(f"Loaded {len(self.df)} rows and {len(self.df.columns)} columns.")
+        self._validate_inputs()
+        self._update_chart_options(pd.DataFrame())
+
+    def _resolve_csv_paths(self) -> list[str]:
+        raw = self.csv_path_var.get().strip()
+        if not raw:
+            return self.csv_paths
+        paths = [item.strip() for item in raw.replace("\n", ";").split(";") if item.strip()]
+        return paths
 
     def _populate_columns(self) -> None:
         columns = list(self.df.columns) if self.df is not None else []
@@ -431,6 +605,166 @@ class ToolBuilderApp(tk.Tk):
             )
         ]
 
+    def _validate_inputs(self) -> None:
+        warnings: list[str] = []
+        if not self._resolve_csv_paths():
+            warnings.append("Pick at least one CSV file.")
+        merge_mode = self.merge_mode_var.get()
+        if merge_mode == "Side-by-side (join)":
+            join_key = self.merge_key_var.get().strip()
+            if not join_key:
+                warnings.append("Join key is required for side-by-side merges.")
+            elif self.df is not None and join_key not in self.df.columns:
+                warnings.append(f"Join key '{join_key}' not found in loaded data.")
+        if self.df is not None:
+            selected_columns = self._selected_listbox_values(self.column_listbox)
+            if not selected_columns:
+                warnings.append("Select at least one column to analyze.")
+            if self.operation_var.get() in NUMERIC_OPERATIONS and selected_columns:
+                non_numeric = _columns_missing_numeric_values(self.df, selected_columns)
+                if non_numeric:
+                    warnings.append(f"Non-numeric columns selected: {', '.join(non_numeric)}.")
+        filter_value = self.filter_value_var.get().strip()
+        if self.filter_operator_var.get() in {">", ">=", "<", "<="} and filter_value:
+            try:
+                float(filter_value)
+            except ValueError:
+                warnings.append("Filter value should be numeric for comparison operators.")
+        self.warning_var.set("Warnings: " + " ".join(warnings) if warnings else "")
+
+    def _apply_theme(self) -> None:
+        style = ttk.Style(self)
+        theme = self.theme_var.get()
+        default_font = tkfont.nametofont("TkDefaultFont")
+        text_bg = "white"
+        text_fg = "black"
+        if theme == "Dark":
+            style.configure(".", background="#1f1f1f", foreground="#f2f2f2")
+            style.configure("TLabel", background="#1f1f1f", foreground="#f2f2f2")
+            style.configure("TLabelframe", background="#1f1f1f", foreground="#f2f2f2")
+            style.configure("TLabelframe.Label", background="#1f1f1f", foreground="#f2f2f2")
+            text_bg = "#2a2a2a"
+            text_fg = "#f2f2f2"
+            default_font.configure(size=self._base_font_size)
+        elif theme == "Large Fonts":
+            style.configure(".", background="", foreground="")
+            default_font.configure(size=self._base_font_size + 2)
+        elif theme == "Compact":
+            style.configure(".", background="", foreground="")
+            default_font.configure(size=max(8, self._base_font_size - 2))
+        else:
+            style.configure(".", background="", foreground="")
+            default_font.configure(size=self._base_font_size)
+        self.results_text.configure(background=text_bg, foreground=text_fg)
+        self.preview_text.configure(background=text_bg, foreground=text_fg)
+        self.chart_canvas.configure(background="white" if theme != "Dark" else "#2a2a2a")
+
+    def _smart_suggest(self) -> None:
+        if self.df is None:
+            messagebox.showwarning("No Data", "Load a CSV file before requesting suggestions.")
+            return
+        suggestions = suggest_columns(self.df)
+        group_by = suggestions.get("group_by", [])
+        numeric = suggestions.get("numeric", [])
+        top_patterns = suggestions.get("top_patterns", {})
+        lines = []
+        if group_by:
+            lines.append(f"Suggested group-by columns: {', '.join(group_by)}")
+        if numeric:
+            lines.append(f"Numeric columns: {', '.join(numeric)}")
+        if top_patterns:
+            for column, counts in top_patterns.items():
+                patterns = ", ".join(f"{key} ({value})" for key, value in counts.items())
+                lines.append(f"Top values in {column}: {patterns}")
+        if not lines:
+            lines.append("No suggestions available for the current data.")
+        messagebox.showinfo("Smart Suggestions", "\n".join(lines))
+
+    def _update_chart_options(self, result: pd.DataFrame) -> None:
+        numeric_columns = result.select_dtypes(include="number").columns.tolist()
+        self.chart_column_combo["values"] = numeric_columns
+        if numeric_columns:
+            if self.chart_column_var.get() not in numeric_columns:
+                self.chart_column_var.set(numeric_columns[0])
+        else:
+            self.chart_column_var.set("")
+
+    def _render_chart(self) -> None:
+        self.chart_canvas.delete("all")
+        if not isinstance(self.last_result, pd.DataFrame):
+            self.chart_canvas.create_text(10, 10, anchor="nw", text="No chartable data available.")
+            return
+        result = self.last_result
+        if result.empty:
+            self.chart_canvas.create_text(10, 10, anchor="nw", text="No data to chart.")
+            return
+        column = self.chart_column_var.get()
+        if not column:
+            self.chart_canvas.create_text(10, 10, anchor="nw", text="Select a numeric column to chart.")
+            return
+        chart_type = self.chart_type_var.get()
+        labels = [str(label) for label in result.index.tolist()]
+        values = pd.to_numeric(result[column], errors="coerce").fillna(0).tolist()
+        if len(values) > 20:
+            self.chart_canvas.create_text(10, 10, anchor="nw", text="Chart preview limited to 20 points.")
+            labels = labels[:20]
+            values = values[:20]
+        self.chart_canvas.update_idletasks()
+        width = self.chart_canvas.winfo_width() or 600
+        height = self.chart_canvas.winfo_height() or 320
+        padding = 40
+        if chart_type == "Pie":
+            total = sum(abs(value) for value in values)
+            if total == 0:
+                self.chart_canvas.create_text(10, 10, anchor="nw", text="Pie chart needs non-zero values.")
+                return
+            start_angle = 0
+            radius = min(width, height) // 3
+            center_x = width // 2
+            center_y = height // 2
+            for idx, value in enumerate(values):
+                extent = 360 * abs(value) / total
+                color = f"#{(idx * 40 + 60) % 255:02x}{(idx * 80 + 90) % 255:02x}{(idx * 120 + 120) % 255:02x}"
+                self.chart_canvas.create_arc(
+                    center_x - radius,
+                    center_y - radius,
+                    center_x + radius,
+                    center_y + radius,
+                    start=start_angle,
+                    extent=extent,
+                    fill=color,
+                    outline="",
+                )
+                start_angle += extent
+            self.chart_canvas.create_text(10, height - 20, anchor="sw", text=" | ".join(labels))
+            return
+        max_value = max(values) if values else 1
+        min_value = min(values) if values else 0
+        value_range = max_value - min_value or 1
+        if chart_type == "Bar":
+            bar_width = (width - 2 * padding) / max(1, len(values))
+            for idx, value in enumerate(values):
+                x0 = padding + idx * bar_width
+                x1 = x0 + bar_width * 0.8
+                scaled = (value - min_value) / value_range
+                y1 = height - padding
+                y0 = y1 - scaled * (height - 2 * padding)
+                self.chart_canvas.create_rectangle(x0, y0, x1, y1, fill="#4a90e2", outline="")
+        else:
+            points = []
+            for idx, value in enumerate(values):
+                x = padding + idx * (width - 2 * padding) / max(1, len(values) - 1)
+                scaled = (value - min_value) / value_range
+                y = height - padding - scaled * (height - 2 * padding)
+                points.append((x, y))
+            for idx in range(1, len(points)):
+                self.chart_canvas.create_line(*points[idx - 1], *points[idx], fill="#4a90e2", width=2)
+            for x, y in points:
+                self.chart_canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#4a90e2", outline="")
+        for idx, label in enumerate(labels):
+            x = padding + idx * (width - 2 * padding) / max(1, len(labels) - 1)
+            self.chart_canvas.create_text(x, height - padding + 10, text=label, anchor="n")
+
     def _run_analysis(self) -> None:
         if self.df is None:
             messagebox.showwarning("No Data", "Load a CSV file before running analysis.")
@@ -449,6 +783,8 @@ class ToolBuilderApp(tk.Tk):
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert(tk.END, result.to_string())
         self.status_var.set("Analysis complete.")
+        self._update_chart_options(result)
+        self._render_chart()
 
     def _save_results(self) -> None:
         if self.last_result is None:
@@ -472,12 +808,80 @@ class ToolBuilderApp(tk.Tk):
             return
         self.status_var.set(f"Results saved to {path}.")
 
+    def _copy_results(self) -> None:
+        if self.last_result is None:
+            messagebox.showwarning("No Results", "Run an analysis first.")
+            return
+        text = self.last_result.to_string() if isinstance(self.last_result, pd.DataFrame) else str(self.last_result)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_var.set("Results copied to clipboard.")
+
+    def _run_recipe_batch(self) -> None:
+        recipe_path = filedialog.askopenfilename(filetypes=[("JSON Files", "*.json")])
+        if not recipe_path:
+            return
+        folder = filedialog.askdirectory()
+        if not folder:
+            return
+        try:
+            data = json.loads(Path(recipe_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Recipe Error", f"Could not load recipe: {exc}")
+            return
+        merge_mode = data.get("merge_mode", MERGE_MODES[0])
+        if merge_mode != "Single file":
+            messagebox.showwarning(
+                "Batch Limit",
+                "Batch runs support single-file recipes. Adjust the recipe merge mode to Single file.",
+            )
+            return
+        selected_columns = data.get("selected_columns", [])
+        group_by = data.get("group_by", [])
+        operation = data.get("operation", OPERATIONS[0])
+        filter_data = data.get("filter", {})
+        filter_rules = []
+        if filter_data.get("column") and filter_data.get("value"):
+            filter_rules.append(
+                FilterRule(
+                    column=filter_data.get("column", ""),
+                    operator=filter_data.get("operator", FILTER_OPERATORS[0]),
+                    value=filter_data.get("value", ""),
+                )
+            )
+        rows = []
+        for csv_path in sorted(Path(folder).glob("*.csv")):
+            try:
+                df = load_dataframe(csv_path)
+                filtered = apply_filters(df, filter_rules)
+                result = perform_operation(filtered, selected_columns, group_by, operation)
+            except ValueError as exc:
+                messagebox.showerror("Batch Error", f"{csv_path.name}: {exc}")
+                return
+            if result.empty:
+                continue
+            prepared = result.reset_index()
+            prepared.insert(0, "Source File", csv_path.name)
+            rows.append(prepared)
+        if not rows:
+            messagebox.showwarning("Batch Results", "No results produced for the selected folder.")
+            return
+        aggregated = pd.concat(rows, ignore_index=True)
+        self.last_result = aggregated
+        self.results_text.delete("1.0", tk.END)
+        self.results_text.insert(tk.END, aggregated.to_string(index=False))
+        self.status_var.set(f"Batch run complete for {len(rows)} files.")
+        self._update_chart_options(aggregated)
+        self._render_chart()
+
     def _save_recipe(self) -> None:
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Files", "*.json")])
         if not path:
             return
         recipe = {
-            "csv_path": self.csv_path_var.get(),
+            "csv_paths": self._resolve_csv_paths(),
+            "merge_mode": self.merge_mode_var.get(),
+            "merge_key": self.merge_key_var.get(),
             "selected_columns": self._selected_listbox_values(self.column_listbox),
             "group_by": self._selected_listbox_values(self.group_listbox),
             "operation": self.operation_var.get(),
@@ -503,9 +907,14 @@ class ToolBuilderApp(tk.Tk):
         except (OSError, json.JSONDecodeError) as exc:
             messagebox.showerror("Recipe Error", f"Could not load recipe: {exc}")
             return
+        csv_paths = data.get("csv_paths") or []
         csv_path = data.get("csv_path") or ""
-        if csv_path:
-            self._load_csv(csv_path)
+        if csv_path and not csv_paths:
+            csv_paths = [csv_path]
+        self.merge_mode_var.set(data.get("merge_mode", MERGE_MODES[0]))
+        self.merge_key_var.set(data.get("merge_key", ""))
+        if csv_paths:
+            self._load_csv(csv_paths)
         self.operation_var.set(data.get("operation", OPERATIONS[0]))
         self._set_listbox_selection(self.column_listbox, data.get("selected_columns", []))
         self._set_listbox_selection(self.group_listbox, data.get("group_by", []))
@@ -514,6 +923,7 @@ class ToolBuilderApp(tk.Tk):
         self.filter_operator_var.set(filter_data.get("operator", FILTER_OPERATORS[0]))
         self.filter_value_var.set(filter_data.get("value", ""))
         self.status_var.set(f"Loaded recipe from {path}.")
+        self._validate_inputs()
 
     def _set_listbox_selection(self, listbox: tk.Listbox, values: list[str]) -> None:
         listbox.selection_clear(0, tk.END)
@@ -525,11 +935,14 @@ class ToolBuilderApp(tk.Tk):
     def _clear_filter(self) -> None:
         self.filter_value_var.set("")
         self.status_var.set("Filter cleared.")
+        self._validate_inputs()
 
     def _clear_results(self) -> None:
         self.results_text.delete("1.0", tk.END)
         self.last_result = None
         self.status_var.set("Results cleared.")
+        self._validate_inputs()
+        self._render_chart()
 
 
 def self_check() -> tuple[bool, str]:
@@ -546,6 +959,14 @@ def self_check() -> tuple[bool, str]:
         filtered = apply_filters(df, [FilterRule("Shift", "=", "B")])
         if len(filtered) != 2:
             return False, "Self-check failed: filter count mismatch."
+        with tempfile.TemporaryDirectory() as tmpdir:
+            left_path = Path(tmpdir) / "left.csv"
+            right_path = Path(tmpdir) / "right.csv"
+            df[["Shift", "Duration"]].to_csv(left_path, index=False)
+            df[["Shift", "Reason"]].to_csv(right_path, index=False)
+            merged = merge_dataframes([str(left_path), str(right_path)], "Side-by-side (join)", "Shift")
+            if "left_Duration" not in merged.columns:
+                return False, "Self-check failed: merge result missing expected columns."
     except Exception as exc:  # noqa: BLE001 - surface for diagnostics
         return False, f"Self-check failed: {exc}"
     return True, "Self-check passed."
