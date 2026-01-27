@@ -16,16 +16,23 @@ import io
 import json
 import math
 import tempfile
+import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-from tools import tool_plugins, tool_sessions
+from tools import tool_plugins, tool_sessions, tool_settings, tool_updater, tool_watchdog
+
+
+PANDAS_AVAILABLE = importlib.util.find_spec("pandas") is not None
+if PANDAS_AVAILABLE:
+    import pandas as pd
+else:
+    pd = None
 
 
 OPERATIONS = [
@@ -46,6 +53,7 @@ NUMERIC_OPERATIONS = {"SUM", "AVERAGE", "MAX", "MIN", "OUTLIER DETECTION", "TREN
 CHART_TYPES = ["Bar", "Line", "Pie"]
 THEME_MODES = ["Default", "Dark", "Large Fonts", "Compact"]
 PLUGIN_FOLDER = Path(__file__).resolve().parent / "plugins"
+SESSION_PATH = tool_sessions.default_session_path()
 
 
 @dataclass(frozen=True)
@@ -88,7 +96,13 @@ def get_tool_metadata() -> dict[str, str]:
     }
 
 
+def _require_pandas() -> None:
+    if pd is None:
+        raise RuntimeError("pandas is required for Tool Builder. Install pandas to continue.")
+
+
 def load_dataframe(csv_path: str | Path) -> pd.DataFrame:
+    _require_pandas()
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"CSV file not found: {path}")
@@ -102,6 +116,7 @@ def load_dataframe(csv_path: str | Path) -> pd.DataFrame:
 
 
 def merge_dataframes(paths: list[str], mode: str, join_key: str | None) -> pd.DataFrame:
+    _require_pandas()
     if not paths:
         raise ValueError("Select at least one CSV file.")
     dataframes = [load_dataframe(path) for path in paths]
@@ -130,10 +145,12 @@ def merge_dataframes(paths: list[str], mode: str, join_key: str | None) -> pd.Da
 
 
 def preview_dataframe(df: pd.DataFrame, rows: int = 8) -> str:
+    _require_pandas()
     return df.head(rows).to_string(index=False)
 
 
 def apply_filters(df: pd.DataFrame, filters: list[FilterRule]) -> pd.DataFrame:
+    _require_pandas()
     filtered = df.copy()
     for rule in filters:
         if not rule.column or not rule.operator:
@@ -169,6 +186,7 @@ def apply_filters(df: pd.DataFrame, filters: list[FilterRule]) -> pd.DataFrame:
 
 
 def _coerce_numeric(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    _require_pandas()
     numeric_df = df[columns].apply(pd.to_numeric, errors="coerce")
     non_numeric = [col for col in columns if numeric_df[col].notna().sum() == 0]
     if non_numeric:
@@ -178,11 +196,13 @@ def _coerce_numeric(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
 
 
 def _columns_missing_numeric_values(df: pd.DataFrame, columns: list[str]) -> list[str]:
+    _require_pandas()
     numeric_df = df[columns].apply(pd.to_numeric, errors="coerce")
     return [col for col in columns if numeric_df[col].notna().sum() == 0]
 
 
 def suggest_columns(df: pd.DataFrame) -> dict[str, Any]:
+    _require_pandas()
     row_count = len(df)
     suggestions: dict[str, Any] = {"group_by": [], "numeric": [], "top_patterns": {}}
     if row_count == 0:
@@ -227,6 +247,7 @@ def perform_operation(
     group_by: list[str],
     operation: str,
 ) -> pd.DataFrame:
+    _require_pandas()
     if not selected_columns:
         raise ValueError("Select at least one column for analysis.")
     missing_cols = [col for col in selected_columns if col not in df.columns]
@@ -313,6 +334,8 @@ def perform_operation(
 
 class ToolBuilderApp(tk.Tk):
     def __init__(self, initial_csv: str | None = None) -> None:
+        if pd is None:
+            raise RuntimeError("pandas is required for Tool Builder. Install pandas to continue.")
         super().__init__()
         self.title("MOIT Tool Builder Wizard")
         self.geometry("1050x750")
@@ -321,6 +344,8 @@ class ToolBuilderApp(tk.Tk):
         self.csv_paths: list[str] = []
         self.chart_config = tool_sessions.ChartConfig()
         self.plugins: list[tool_plugins.PluginTool] = []
+
+        settings = tool_settings.load_settings(tool_settings.default_settings_path())
 
         self.csv_path_var = tk.StringVar(value=initial_csv or "")
         self.operation_var = tk.StringVar(value=OPERATIONS[0])
@@ -335,11 +360,28 @@ class ToolBuilderApp(tk.Tk):
         self.status_var = tk.StringVar(value="Load a CSV to begin.")
         self.warning_var = tk.StringVar(value="")
         self.plugin_var = tk.StringVar(value="")
+        self.auto_reload_csv_var = tk.BooleanVar(value=settings.auto_reload_csv)
+        self.silent_csv_reload_var = tk.BooleanVar(value=settings.silent_csv_reload)
+        self.auto_reload_plugins_var = tk.BooleanVar(value=settings.auto_reload_plugins)
+        self.restore_session_var = tk.BooleanVar(value=settings.restore_last_session)
+        self.auto_save_session_var = tk.BooleanVar(value=settings.auto_save_session)
+        self.check_updates_var = tk.BooleanVar(value=settings.check_updates_on_launch)
         self._base_font_size = tkfont.nametofont("TkDefaultFont").actual()["size"]
+        self._csv_poll_interval = settings.csv_poll_interval
+        self._csv_watcher: tool_watchdog.FileChangeWatcher | None = None
+        self._plugin_watcher: tool_watchdog.DirectoryWatcher | None = None
+        self._csv_reload_prompt_active = False
+        self._update_check_in_progress = False
 
         self._build_layout()
+        self._initialize_watchers(self._csv_poll_interval)
+        self._bind_setting_traces()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         if initial_csv:
             self._load_csv([initial_csv])
+        else:
+            self.after(200, self._maybe_restore_session)
+        self.after(400, self._maybe_check_updates_on_launch)
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -473,8 +515,52 @@ class ToolBuilderApp(tk.Tk):
         plugin_reload_btn = ttk.Button(plugin_frame, text="Reload Plugins", command=self._reload_plugins)
         plugin_reload_btn.grid(row=0, column=3, sticky="w", padx=8, pady=6)
 
+        live_frame = ttk.LabelFrame(self, text="Live Updates & Session")
+        live_frame.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 6))
+        for column in range(4):
+            live_frame.columnconfigure(column, weight=1)
+
+        auto_reload_csv_check = ttk.Checkbutton(
+            live_frame,
+            text="Auto-reload CSV on change",
+            variable=self.auto_reload_csv_var,
+        )
+        auto_reload_csv_check.grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        self.silent_reload_check = ttk.Checkbutton(
+            live_frame,
+            text="Silent CSV reload",
+            variable=self.silent_csv_reload_var,
+        )
+        self.silent_reload_check.grid(row=0, column=1, sticky="w", padx=8, pady=4)
+        auto_reload_plugins_check = ttk.Checkbutton(
+            live_frame,
+            text="Auto-reload plugins",
+            variable=self.auto_reload_plugins_var,
+        )
+        auto_reload_plugins_check.grid(row=0, column=2, sticky="w", padx=8, pady=4)
+        restore_session_check = ttk.Checkbutton(
+            live_frame,
+            text="Restore last session",
+            variable=self.restore_session_var,
+        )
+        restore_session_check.grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        auto_save_session_check = ttk.Checkbutton(
+            live_frame,
+            text="Auto-save session on exit",
+            variable=self.auto_save_session_var,
+        )
+        auto_save_session_check.grid(row=1, column=1, sticky="w", padx=8, pady=4)
+        check_updates_check = ttk.Checkbutton(
+            live_frame,
+            text="Check updates on launch",
+            variable=self.check_updates_var,
+        )
+        check_updates_check.grid(row=1, column=2, sticky="w", padx=8, pady=4)
+        check_updates_btn = ttk.Button(live_frame, text="Check for Updates", command=self._check_for_updates)
+        check_updates_btn.grid(row=1, column=3, sticky="e", padx=8, pady=4)
+
         result_frame = ttk.LabelFrame(self, text="4) Results")
-        result_frame.grid(row=8, column=0, sticky="nsew", padx=16, pady=6)
+        result_frame.grid(row=9, column=0, sticky="nsew", padx=16, pady=6)
         result_frame.columnconfigure(0, weight=1)
         result_frame.rowconfigure(0, weight=1)
         results_notebook = ttk.Notebook(result_frame)
@@ -521,7 +607,7 @@ class ToolBuilderApp(tk.Tk):
         results_notebook.add(chart_frame, text="Chart Preview")
 
         status_frame = ttk.Frame(self)
-        status_frame.grid(row=9, column=0, sticky="ew", padx=16, pady=(4, 12))
+        status_frame.grid(row=10, column=0, sticky="ew", padx=16, pady=(4, 12))
         status_label = ttk.Label(status_frame, textvariable=self.status_var)
         status_label.pack(anchor="w")
         warning_label = tk.Label(status_frame, textvariable=self.warning_var, fg="#b54700")
@@ -557,8 +643,15 @@ class ToolBuilderApp(tk.Tk):
         Tooltip(self.plugin_combo, "Select a plugin from the plugins folder.")
         Tooltip(plugin_run_btn, "Run the selected plugin against the loaded data.")
         Tooltip(plugin_reload_btn, "Reload plugins from the plugins folder.")
+        Tooltip(auto_reload_csv_check, "Watch the loaded CSV files for changes and reload them.")
+        Tooltip(self.silent_reload_check, "Reload CSV files automatically without prompting.")
+        Tooltip(auto_reload_plugins_check, "Watch the plugins folder for new or updated plugins.")
+        Tooltip(restore_session_check, "Prompt to restore the last saved session on startup.")
+        Tooltip(auto_save_session_check, "Save session state when closing the Tool Builder.")
+        Tooltip(check_updates_check, "Check for updates automatically when launching the tool.")
+        Tooltip(check_updates_btn, "Check GitHub for a newer Tool Builder version.")
 
-        self.rowconfigure(8, weight=1)
+        self.rowconfigure(9, weight=1)
 
         self.column_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
         self.group_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
@@ -605,6 +698,7 @@ class ToolBuilderApp(tk.Tk):
             return
         self.csv_path_var.set("; ".join(paths))
         self.csv_paths = paths
+        self._update_csv_watch(paths)
         self.preview_text.delete("1.0", tk.END)
         self.preview_text.insert(tk.END, preview_dataframe(self.df))
         self._populate_columns()
@@ -1005,7 +1099,7 @@ class ToolBuilderApp(tk.Tk):
             return False
         return True
 
-    def _reload_plugins(self) -> None:
+    def _reload_plugins(self, status_message: str | None = None) -> None:
         PLUGIN_FOLDER.mkdir(parents=True, exist_ok=True)
         plugins, errors = tool_plugins.load_plugins(PLUGIN_FOLDER)
         self.plugins = plugins
@@ -1017,9 +1111,247 @@ class ToolBuilderApp(tk.Tk):
         else:
             self.plugin_var.set("")
         if hasattr(self, "plugin_var"):
-            self.status_var.set("Plugins loaded." if plugins else "No plugins found.")
+            if status_message:
+                self.status_var.set(status_message)
+            else:
+                self.status_var.set("Plugins loaded." if plugins else "No plugins found.")
         if errors:
             messagebox.showwarning("Plugin Load Issues", "\n".join(errors))
+
+    def _initialize_watchers(self, interval: float) -> None:
+        PLUGIN_FOLDER.mkdir(parents=True, exist_ok=True)
+        self._csv_watcher = tool_watchdog.FileChangeWatcher([], interval, self._on_csv_files_changed)
+        self._plugin_watcher = tool_watchdog.DirectoryWatcher(PLUGIN_FOLDER, interval, self._on_plugins_changed)
+        if self.auto_reload_csv_var.get():
+            self._csv_watcher.start()
+        if self.auto_reload_plugins_var.get():
+            self._plugin_watcher.start()
+        self._update_silent_reload_state()
+
+    def _bind_setting_traces(self) -> None:
+        self.auto_reload_csv_var.trace_add("write", lambda *_args: self._handle_csv_watch_toggle())
+        self.auto_reload_plugins_var.trace_add("write", lambda *_args: self._handle_plugin_watch_toggle())
+
+    def _handle_csv_watch_toggle(self) -> None:
+        self._update_silent_reload_state()
+        if not self._csv_watcher:
+            return
+        if self.auto_reload_csv_var.get():
+            self._csv_watcher.start()
+            self.status_var.set("CSV auto-reload enabled.")
+        else:
+            self._csv_watcher.stop()
+            self.status_var.set("CSV auto-reload disabled.")
+
+    def _handle_plugin_watch_toggle(self) -> None:
+        if not self._plugin_watcher:
+            return
+        if self.auto_reload_plugins_var.get():
+            self._plugin_watcher.start()
+            self.status_var.set("Plugin auto-reload enabled.")
+        else:
+            self._plugin_watcher.stop()
+            self.status_var.set("Plugin auto-reload disabled.")
+
+    def _update_silent_reload_state(self) -> None:
+        if hasattr(self, "silent_reload_check"):
+            state = "normal" if self.auto_reload_csv_var.get() else "disabled"
+            self.silent_reload_check.configure(state=state)
+
+    def _update_csv_watch(self, paths: list[str]) -> None:
+        if self._csv_watcher:
+            self._csv_watcher.update_paths([Path(path) for path in paths])
+
+    def _on_csv_files_changed(self, changed_paths: list[Path]) -> None:
+        if not self.auto_reload_csv_var.get() or not self.csv_paths:
+            return
+        if self._csv_reload_prompt_active:
+            return
+
+        def prompt_reload() -> None:
+            self._csv_reload_prompt_active = False
+            if not self.auto_reload_csv_var.get():
+                return
+            if self.silent_csv_reload_var.get():
+                self._reload_current_csv(silent=True)
+                return
+            if messagebox.askyesno("CSV Updated", "CSV file has changed. Reload now?"):
+                self._reload_current_csv(silent=False)
+
+        self._csv_reload_prompt_active = True
+        self.after(0, prompt_reload)
+
+    def _reload_current_csv(self, silent: bool) -> None:
+        if not self.csv_paths:
+            return
+        self.status_var.set("Reloading CSV data...")
+        self._load_csv(self.csv_paths)
+        if silent:
+            self.status_var.set("CSV auto-reload complete.")
+
+    def _on_plugins_changed(self, change: tool_watchdog.DirectoryChange) -> None:
+        if not self.auto_reload_plugins_var.get():
+            return
+
+        def reload_plugins() -> None:
+            message_parts = []
+            if change.added:
+                message_parts.append(f"Added: {', '.join(sorted(change.added))}")
+            if change.removed:
+                message_parts.append(f"Removed: {', '.join(sorted(change.removed))}")
+            if change.modified:
+                message_parts.append(f"Updated: {', '.join(sorted(change.modified))}")
+            status_message = "Plugins reloaded."
+            if message_parts:
+                status_message = f"Plugins reloaded. {' | '.join(message_parts)}"
+            self._reload_plugins(status_message=status_message)
+
+        self.after(0, reload_plugins)
+
+    def _maybe_restore_session(self) -> None:
+        if not self.restore_session_var.get():
+            return
+        if not SESSION_PATH.exists():
+            return
+        if messagebox.askyesno("Restore Session", "Restore the last session settings?"):
+            self._load_session_from_path(SESSION_PATH, source="Auto-restored session")
+
+    def _maybe_check_updates_on_launch(self) -> None:
+        if self.check_updates_var.get():
+            self._check_for_updates()
+
+    def _check_for_updates(self) -> None:
+        if self._update_check_in_progress:
+            return
+        self._update_check_in_progress = True
+        self.status_var.set("Checking for updates...")
+
+        def run_check() -> None:
+            repo_path = Path(__file__).resolve().parents[1]
+            version_path = tool_updater.default_version_path()
+            result = tool_updater.check_for_updates(repo_path, version_path)
+            self.after(0, lambda: self._handle_update_result(result))
+
+        threading.Thread(target=run_check, daemon=True).start()
+
+    def _handle_update_result(self, result: tool_updater.UpdateCheckResult) -> None:
+        self._update_check_in_progress = False
+        if result.status == "up_to_date":
+            self.status_var.set(result.message)
+            messagebox.showinfo("Update Check", result.message)
+            return
+        if result.status == "update_available":
+            prompt = "New version available. Run 'git pull'?"
+            if messagebox.askyesno("Update Available", prompt):
+                self._run_git_pull()
+            else:
+                self.status_var.set("Update available but skipped.")
+            return
+        self.status_var.set(result.message)
+        messagebox.showwarning("Update Check", result.message)
+
+    def _run_git_pull(self) -> None:
+        self.status_var.set("Running git pull...")
+
+        def run_pull() -> None:
+            repo_path = Path(__file__).resolve().parents[1]
+            version_path = tool_updater.default_version_path()
+            ok, message = tool_updater.run_git_pull(repo_path, version_path)
+            self.after(0, lambda: self._finish_git_pull(ok, message))
+
+        threading.Thread(target=run_pull, daemon=True).start()
+
+    def _finish_git_pull(self, ok: bool, message: str) -> None:
+        if ok:
+            self.status_var.set("Update complete.")
+            messagebox.showinfo("Update Complete", message)
+        else:
+            self.status_var.set("Update failed.")
+            messagebox.showerror("Update Failed", message)
+
+    def _build_session_payload(self) -> dict[str, Any]:
+        return tool_sessions.build_session_payload(
+            csv_paths=self._resolve_csv_paths(),
+            merge_mode=self.merge_mode_var.get(),
+            merge_key=self.merge_key_var.get(),
+            selected_columns=self._selected_listbox_values(self.column_listbox),
+            group_by=self._selected_listbox_values(self.group_listbox),
+            operation=self.operation_var.get(),
+            filter_data={
+                "column": self.filter_column_var.get(),
+                "operator": self.filter_operator_var.get(),
+                "value": self.filter_value_var.get(),
+            },
+            chart_config=self.chart_config,
+            last_result=self.last_result,
+        )
+
+    def _save_session_to_path(self, path: Path) -> None:
+        payload = self._build_session_payload()
+        tool_sessions.save_session(path, payload)
+
+    def _load_session_from_path(self, path: Path, source: str) -> None:
+        try:
+            data = tool_sessions.load_session(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Session Error", f"Could not load session: {exc}")
+            return
+        self._apply_session_data(data, source)
+
+    def _apply_session_data(self, data: dict[str, Any], source: str) -> None:
+        csv_paths = data.get("csv_paths") or []
+        if csv_paths:
+            self.merge_mode_var.set(data.get("merge_mode", MERGE_MODES[0]))
+            self.merge_key_var.set(data.get("merge_key", ""))
+            self._load_csv(csv_paths)
+        self.operation_var.set(data.get("operation", OPERATIONS[0]))
+        self._set_listbox_selection(self.column_listbox, data.get("selected_columns", []))
+        self._set_listbox_selection(self.group_listbox, data.get("group_by", []))
+        filter_data = data.get("filter", {})
+        self.filter_column_var.set(filter_data.get("column", ""))
+        self.filter_operator_var.set(filter_data.get("operator", FILTER_OPERATORS[0]))
+        self.filter_value_var.set(filter_data.get("value", ""))
+        self.chart_config = tool_sessions.ChartConfig.from_dict(data.get("chart_config", {}))
+        self.last_result = tool_sessions.deserialize_last_result(data.get("last_result", {}))
+        self.results_text.delete("1.0", tk.END)
+        if isinstance(self.last_result, pd.DataFrame):
+            self.results_text.insert(tk.END, self.last_result.to_string())
+            self._update_chart_options(self.last_result)
+            self._render_chart()
+        elif self.last_result is not None:
+            self.results_text.insert(tk.END, str(self.last_result))
+            self._render_chart()
+        self.status_var.set(source)
+        self._validate_inputs()
+
+    def _save_settings(self) -> None:
+        settings = tool_settings.ToolBuilderSettings(
+            restore_last_session=self.restore_session_var.get(),
+            auto_save_session=self.auto_save_session_var.get(),
+            auto_reload_csv=self.auto_reload_csv_var.get(),
+            silent_csv_reload=self.silent_csv_reload_var.get(),
+            auto_reload_plugins=self.auto_reload_plugins_var.get(),
+            check_updates_on_launch=self.check_updates_var.get(),
+            csv_poll_interval=self._csv_poll_interval,
+        )
+        tool_settings.save_settings(tool_settings.default_settings_path(), settings)
+
+    def _save_auto_session(self) -> None:
+        if not self.auto_save_session_var.get():
+            return
+        try:
+            self._save_session_to_path(SESSION_PATH)
+        except OSError as exc:
+            self.status_var.set(f"Auto-save failed: {exc}")
+
+    def _on_close(self) -> None:
+        self._save_auto_session()
+        self._save_settings()
+        if self._csv_watcher:
+            self._csv_watcher.stop()
+        if self._plugin_watcher:
+            self._plugin_watcher.stop()
+        self.destroy()
 
     def _run_plugin(self) -> None:
         if self.df is None:
@@ -1054,23 +1386,8 @@ class ToolBuilderApp(tk.Tk):
         )
         if not path:
             return
-        payload = tool_sessions.build_session_payload(
-            csv_paths=self._resolve_csv_paths(),
-            merge_mode=self.merge_mode_var.get(),
-            merge_key=self.merge_key_var.get(),
-            selected_columns=self._selected_listbox_values(self.column_listbox),
-            group_by=self._selected_listbox_values(self.group_listbox),
-            operation=self.operation_var.get(),
-            filter_data={
-                "column": self.filter_column_var.get(),
-                "operator": self.filter_operator_var.get(),
-                "value": self.filter_value_var.get(),
-            },
-            chart_config=self.chart_config,
-            last_result=self.last_result,
-        )
         try:
-            tool_sessions.save_session(path, payload)
+            self._save_session_to_path(Path(path))
         except OSError as exc:
             messagebox.showerror("Session Error", f"Could not save session: {exc}")
             return
@@ -1080,35 +1397,7 @@ class ToolBuilderApp(tk.Tk):
         path = filedialog.askopenfilename(filetypes=[("MOIT Session", "*.moitsession.json")])
         if not path:
             return
-        try:
-            data = tool_sessions.load_session(path)
-        except (OSError, json.JSONDecodeError) as exc:
-            messagebox.showerror("Session Error", f"Could not load session: {exc}")
-            return
-        csv_paths = data.get("csv_paths") or []
-        if csv_paths:
-            self.merge_mode_var.set(data.get("merge_mode", MERGE_MODES[0]))
-            self.merge_key_var.set(data.get("merge_key", ""))
-            self._load_csv(csv_paths)
-        self.operation_var.set(data.get("operation", OPERATIONS[0]))
-        self._set_listbox_selection(self.column_listbox, data.get("selected_columns", []))
-        self._set_listbox_selection(self.group_listbox, data.get("group_by", []))
-        filter_data = data.get("filter", {})
-        self.filter_column_var.set(filter_data.get("column", ""))
-        self.filter_operator_var.set(filter_data.get("operator", FILTER_OPERATORS[0]))
-        self.filter_value_var.set(filter_data.get("value", ""))
-        self.chart_config = tool_sessions.ChartConfig.from_dict(data.get("chart_config", {}))
-        self.last_result = tool_sessions.deserialize_last_result(data.get("last_result", {}))
-        self.results_text.delete("1.0", tk.END)
-        if isinstance(self.last_result, pd.DataFrame):
-            self.results_text.insert(tk.END, self.last_result.to_string())
-            self._update_chart_options(self.last_result)
-            self._render_chart()
-        elif self.last_result is not None:
-            self.results_text.insert(tk.END, str(self.last_result))
-            self._render_chart()
-        self.status_var.set(f"Session loaded from {path}.")
-        self._validate_inputs()
+        self._load_session_from_path(Path(path), source=f"Session loaded from {path}.")
 
     def _explain_data(self) -> None:
         if self.df is None:
@@ -1489,6 +1778,8 @@ class ToolBuilderApp(tk.Tk):
 
 
 def self_check() -> tuple[bool, str]:
+    if pd is None:
+        return False, "pandas is required for Tool Builder self-check."
     data = {
         "Shift": ["A", "A", "B", "B"],
         "Duration": [5, 10, 3, 12],
@@ -1516,6 +1807,7 @@ def self_check() -> tuple[bool, str]:
 
 
 def run_analysis(input_path: str) -> str:
+    _require_pandas()
     app = ToolBuilderApp(initial_csv=input_path)
     app.mainloop()
     return "Tool Builder Wizard closed."
@@ -1529,6 +1821,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str]) -> int:
+    if pd is None:
+        print("pandas is required for Tool Builder. Install pandas to continue.")
+        return 1
     parser = _build_parser()
     args = parser.parse_args(argv[1:])
     if args.self_check:
