@@ -19,10 +19,11 @@ from pathlib import Path
 class ToolBuilderSettings:
     restore_last_session: bool = True
     auto_save_session: bool = True
-    auto_reload_csv: bool = True
+    auto_reload_csv: bool = False
     silent_csv_reload: bool = False
-    auto_reload_plugins: bool = True
+    auto_reload_plugins: bool = False
     check_updates_on_launch: bool = False
+    safe_mode: bool = False
     csv_poll_interval: float = 5.0
 
 
@@ -41,10 +42,11 @@ def load_settings(path: str | Path) -> ToolBuilderSettings:
     return ToolBuilderSettings(
         restore_last_session=bool(payload.get("restore_last_session", True)),
         auto_save_session=bool(payload.get("auto_save_session", True)),
-        auto_reload_csv=bool(payload.get("auto_reload_csv", True)),
+        auto_reload_csv=bool(payload.get("auto_reload_csv", False)),
         silent_csv_reload=bool(payload.get("silent_csv_reload", False)),
-        auto_reload_plugins=bool(payload.get("auto_reload_plugins", True)),
+        auto_reload_plugins=bool(payload.get("auto_reload_plugins", False)),
         check_updates_on_launch=bool(payload.get("check_updates_on_launch", False)),
+        safe_mode=bool(payload.get("safe_mode", False)),
         csv_poll_interval=float(payload.get("csv_poll_interval", 5.0)),
     )
 
@@ -60,6 +62,7 @@ def save_settings(path: str | Path, settings: ToolBuilderSettings) -> None:
                 "silent_csv_reload": settings.silent_csv_reload,
                 "auto_reload_plugins": settings.auto_reload_plugins,
                 "check_updates_on_launch": settings.check_updates_on_launch,
+                "safe_mode": settings.safe_mode,
                 "csv_poll_interval": settings.csv_poll_interval,
             },
             indent=2,
@@ -78,6 +81,7 @@ def self_check() -> tuple[bool, str]:
             silent_csv_reload=True,
             auto_reload_plugins=False,
             check_updates_on_launch=True,
+            safe_mode=True,
             csv_poll_interval=3.5,
         )
         save_settings(temp_path, original)

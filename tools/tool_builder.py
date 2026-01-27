@@ -1,38 +1,42 @@
 """Tool Builder Wizard: build simple CSV analyses without coding.
 
 README
-Purpose: Provide a GUI wizard for loading one or more CSV files, merging them, and running common analysis steps.
-Inputs/Outputs: CSV input path(s), optional merge settings, and recipe batch options; outputs results in the GUI,
-chart previews, and can export to CSV/TXT.
-Example command: python tools/tool_builder.py data/sample.csv
-Self-check: python tools/tool_builder.py --self-check
+Purpose: Provide a GUI wizard for loading CSV files, running lightweight analysis, and exporting results.
+Inputs/Outputs: CSV input path(s), analysis settings, optional plugins, outputs results in the GUI and export files.
+Example command: python -m tools.tool_builder
+Self-check: python -m tools.tool_builder --self-check
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import io
 import json
 import math
+import queue
 import tempfile
 import threading
 import zipfile
 from dataclasses import dataclass
+import importlib.util
 from pathlib import Path
 from typing import Any
 
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-from tools import tool_plugins, tool_sessions, tool_settings, tool_updater, tool_watchdog
+from tools import (
+    csv_engine,
+    optional_deps,
+    tool_plugins,
+    tool_sessions,
+    tool_settings,
+    tool_updater,
+    tool_watchdog,
+)
 
-
-PANDAS_AVAILABLE = importlib.util.find_spec("pandas") is not None
-if PANDAS_AVAILABLE:
-    import pandas as pd
-else:
-    pd = None
+PANDAS_AVAILABLE, pd, _PANDAS_MESSAGE = optional_deps.try_import_pandas()
+MATPLOTLIB_AVAILABLE, _mpl, _MATPLOTLIB_MESSAGE = optional_deps.try_import_matplotlib()
 
 
 OPERATIONS = [
@@ -51,7 +55,7 @@ FILTER_OPERATORS = ["=", "!=", ">", ">=", "<", "<=", "contains"]
 MERGE_MODES = ["Single file", "Stack (concat)", "Side-by-side (join)"]
 NUMERIC_OPERATIONS = {"SUM", "AVERAGE", "MAX", "MIN", "OUTLIER DETECTION", "TREND"}
 CHART_TYPES = ["Bar", "Line", "Pie"]
-THEME_MODES = ["Default", "Dark", "Large Fonts", "Compact"]
+DENSITY_MODES = ["Comfortable", "Compact", "Large text"]
 PLUGIN_FOLDER = Path(__file__).resolve().parent / "plugins"
 SESSION_PATH = tool_sessions.default_session_path()
 
@@ -96,27 +100,54 @@ def get_tool_metadata() -> dict[str, str]:
     }
 
 
-def _require_pandas() -> None:
-    if pd is None:
-        raise RuntimeError("pandas is required for Tool Builder. Install pandas to continue.")
+def _requires_pandas(operation: str) -> bool:
+    return operation in {
+        "SUM",
+        "AVERAGE",
+        "MAX",
+        "MIN",
+        "MOST FREQUENT",
+        "MISSING DETECTION",
+        "OUTLIER DETECTION",
+        "TREND",
+    }
 
 
-def load_dataframe(csv_path: str | Path) -> pd.DataFrame:
-    _require_pandas()
-    path = Path(csv_path)
-    if not path.exists():
-        raise FileNotFoundError(f"CSV file not found: {path}")
-    try:
-        df = pd.read_csv(path)
-    except Exception as exc:  # noqa: BLE001 - need to surface CSV parsing errors
-        raise ValueError(f"Invalid CSV: {exc}") from exc
-    if df.empty:
-        raise ValueError("CSV file has no data rows.")
-    return df
+def load_data(paths: list[str], mode: str, join_key: str | None) -> Any:
+    if PANDAS_AVAILABLE and pd is not None:
+        return merge_dataframes(paths, mode, join_key)
+    return csv_engine.merge_tables(paths, mode, join_key)
 
 
-def merge_dataframes(paths: list[str], mode: str, join_key: str | None) -> pd.DataFrame:
-    _require_pandas()
+def preview_data(data: Any, rows: int = 8) -> str:
+    if PANDAS_AVAILABLE and pd is not None and isinstance(data, pd.DataFrame):
+        return data.head(rows).to_string(index=False)
+    if isinstance(data, csv_engine.CSVTable):
+        return data.preview(rows=rows)
+    return "(No preview available.)"
+
+
+def apply_filters(data: Any, filters: list[FilterRule]) -> Any:
+    if PANDAS_AVAILABLE and pd is not None and isinstance(data, pd.DataFrame):
+        return apply_pandas_filters(data, filters)
+    if isinstance(data, csv_engine.CSVTable):
+        return csv_engine.apply_filters(data, [csv_engine.FilterRule(**rule.__dict__) for rule in filters])
+    return data
+
+
+def perform_operation(data: Any, selected_columns: list[str], group_by: list[str], operation: str) -> Any:
+    if PANDAS_AVAILABLE and pd is not None and isinstance(data, pd.DataFrame):
+        return perform_pandas_operation(data, selected_columns, group_by, operation)
+    if operation != "COUNT":
+        raise ValueError("This operation requires pandas. Install optional features to enable it.")
+    if not isinstance(data, csv_engine.CSVTable):
+        raise ValueError("No data loaded.")
+    return csv_engine.group_count(data, group_by, selected_columns)
+
+
+def merge_dataframes(paths: list[str], mode: str, join_key: str | None) -> Any:
+    if not PANDAS_AVAILABLE or pd is None:
+        raise RuntimeError("pandas is required for this operation.")
     if not paths:
         raise ValueError("Select at least one CSV file.")
     dataframes = [load_dataframe(path) for path in paths]
@@ -129,14 +160,12 @@ def merge_dataframes(paths: list[str], mode: str, join_key: str | None) -> pd.Da
     if mode == "Side-by-side (join)":
         if not join_key:
             raise ValueError("Provide a join key column for side-by-side merges.")
-        merged: pd.DataFrame | None = None
+        merged: Any | None = None
         for path, df in zip(paths, dataframes):
             if join_key not in df.columns:
                 raise ValueError(f"Join key '{join_key}' not found in {path}.")
             prefix = Path(path).stem
-            renamed = df.rename(
-                columns={col: f"{prefix}_{col}" for col in df.columns if col != join_key},
-            )
+            renamed = df.rename(columns={col: f"{prefix}_{col}" for col in df.columns if col != join_key})
             merged = renamed if merged is None else pd.merge(merged, renamed, on=join_key, how="outer")
         if merged is None:
             raise ValueError("No data available to merge.")
@@ -144,13 +173,24 @@ def merge_dataframes(paths: list[str], mode: str, join_key: str | None) -> pd.Da
     raise ValueError(f"Unsupported merge mode: {mode}")
 
 
-def preview_dataframe(df: pd.DataFrame, rows: int = 8) -> str:
-    _require_pandas()
-    return df.head(rows).to_string(index=False)
+def load_dataframe(csv_path: str | Path) -> Any:
+    if not PANDAS_AVAILABLE or pd is None:
+        raise RuntimeError("pandas is required for this operation.")
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"CSV file not found: {path}")
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:  # noqa: BLE001 - need to surface CSV parsing errors
+        raise ValueError(f"Invalid CSV: {exc}") from exc
+    if df.empty:
+        raise ValueError("CSV file has no data rows.")
+    return df
 
 
-def apply_filters(df: pd.DataFrame, filters: list[FilterRule]) -> pd.DataFrame:
-    _require_pandas()
+def apply_pandas_filters(df: Any, filters: list[FilterRule]) -> Any:
+    if not PANDAS_AVAILABLE or pd is None:
+        raise RuntimeError("pandas is required for this operation.")
     filtered = df.copy()
     for rule in filters:
         if not rule.column or not rule.operator:
@@ -185,8 +225,9 @@ def apply_filters(df: pd.DataFrame, filters: list[FilterRule]) -> pd.DataFrame:
     return filtered
 
 
-def _coerce_numeric(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    _require_pandas()
+def _coerce_numeric(df: Any, columns: list[str]) -> Any:
+    if not PANDAS_AVAILABLE or pd is None:
+        raise RuntimeError("pandas is required for this operation.")
     numeric_df = df[columns].apply(pd.to_numeric, errors="coerce")
     non_numeric = [col for col in columns if numeric_df[col].notna().sum() == 0]
     if non_numeric:
@@ -195,14 +236,16 @@ def _coerce_numeric(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return numeric_df
 
 
-def _columns_missing_numeric_values(df: pd.DataFrame, columns: list[str]) -> list[str]:
-    _require_pandas()
+def _columns_missing_numeric_values(df: Any, columns: list[str]) -> list[str]:
+    if not PANDAS_AVAILABLE or pd is None:
+        return []
     numeric_df = df[columns].apply(pd.to_numeric, errors="coerce")
     return [col for col in columns if numeric_df[col].notna().sum() == 0]
 
 
-def suggest_columns(df: pd.DataFrame) -> dict[str, Any]:
-    _require_pandas()
+def suggest_columns(df: Any) -> dict[str, Any]:
+    if not PANDAS_AVAILABLE or pd is None:
+        return {"group_by": [], "numeric": [], "top_patterns": {}}
     row_count = len(df)
     suggestions: dict[str, Any] = {"group_by": [], "numeric": [], "top_patterns": {}}
     if row_count == 0:
@@ -222,7 +265,7 @@ def suggest_columns(df: pd.DataFrame) -> dict[str, Any]:
     return suggestions
 
 
-def _trend_slope(series: pd.Series) -> float:
+def _trend_slope(series: Any) -> float:
     values = pd.to_numeric(series, errors="coerce").dropna().tolist()
     if len(values) < 2:
         return 0.0
@@ -241,13 +284,14 @@ def _trend_label(slope: float) -> str:
     return "Up" if slope > 0 else "Down"
 
 
-def perform_operation(
-    df: pd.DataFrame,
+def perform_pandas_operation(
+    df: Any,
     selected_columns: list[str],
     group_by: list[str],
     operation: str,
-) -> pd.DataFrame:
-    _require_pandas()
+) -> Any:
+    if not PANDAS_AVAILABLE or pd is None:
+        raise RuntimeError("pandas is required for this operation.")
     if not selected_columns:
         raise ValueError("Select at least one column for analysis.")
     missing_cols = [col for col in selected_columns if col not in df.columns]
@@ -261,19 +305,19 @@ def perform_operation(
     grouped = df.groupby(group_by) if group_by else None
 
     if operation == "COUNT":
-        return (grouped[selected_columns].count() if grouped else df[selected_columns].count().to_frame().T)
+        return grouped[selected_columns].count() if grouped else df[selected_columns].count().to_frame().T
     if operation == "SUM":
         numeric_df = _coerce_numeric(df, selected_columns)
-        return (grouped[numeric_df.columns].sum() if grouped else numeric_df.sum().to_frame().T)
+        return grouped[numeric_df.columns].sum() if grouped else numeric_df.sum().to_frame().T
     if operation == "AVERAGE":
         numeric_df = _coerce_numeric(df, selected_columns)
-        return (grouped[numeric_df.columns].mean() if grouped else numeric_df.mean().to_frame().T)
+        return grouped[numeric_df.columns].mean() if grouped else numeric_df.mean().to_frame().T
     if operation == "MAX":
         numeric_df = _coerce_numeric(df, selected_columns)
-        return (grouped[numeric_df.columns].max() if grouped else numeric_df.max().to_frame().T)
+        return grouped[numeric_df.columns].max() if grouped else numeric_df.max().to_frame().T
     if operation == "MIN":
         numeric_df = _coerce_numeric(df, selected_columns)
-        return (grouped[numeric_df.columns].min() if grouped else numeric_df.min().to_frame().T)
+        return grouped[numeric_df.columns].min() if grouped else numeric_df.min().to_frame().T
     if operation == "MOST FREQUENT":
         if grouped:
             result = grouped[selected_columns].agg(lambda s: s.mode().iat[0] if not s.mode().empty else "")
@@ -334,16 +378,17 @@ def perform_operation(
 
 class ToolBuilderApp(tk.Tk):
     def __init__(self, initial_csv: str | None = None) -> None:
-        if pd is None:
-            raise RuntimeError("pandas is required for Tool Builder. Install pandas to continue.")
         super().__init__()
         self.title("MOIT Tool Builder Wizard")
-        self.geometry("1050x750")
-        self.df: pd.DataFrame | None = None
-        self.last_result: pd.DataFrame | str | None = None
+        self.geometry("1100x780")
+        self.minsize(980, 640)
+
+        self.data: Any | None = None
+        self.last_result: Any | None = None
         self.csv_paths: list[str] = []
         self.chart_config = tool_sessions.ChartConfig()
         self.plugins: list[tool_plugins.PluginTool] = []
+        self._status_queue: queue.Queue[str] = queue.Queue()
 
         settings = tool_settings.load_settings(tool_settings.default_settings_path())
 
@@ -356,7 +401,8 @@ class ToolBuilderApp(tk.Tk):
         self.merge_key_var = tk.StringVar()
         self.chart_type_var = tk.StringVar(value=CHART_TYPES[0])
         self.chart_column_var = tk.StringVar()
-        self.theme_var = tk.StringVar(value=THEME_MODES[0])
+        self.theme_var = tk.StringVar(value=ttk.Style().theme_use())
+        self.density_var = tk.StringVar(value=DENSITY_MODES[0])
         self.status_var = tk.StringVar(value="Load a CSV to begin.")
         self.warning_var = tk.StringVar(value="")
         self.plugin_var = tk.StringVar(value="")
@@ -366,12 +412,16 @@ class ToolBuilderApp(tk.Tk):
         self.restore_session_var = tk.BooleanVar(value=settings.restore_last_session)
         self.auto_save_session_var = tk.BooleanVar(value=settings.auto_save_session)
         self.check_updates_var = tk.BooleanVar(value=settings.check_updates_on_launch)
+        self.safe_mode_var = tk.BooleanVar(value=settings.safe_mode)
         self._base_font_size = tkfont.nametofont("TkDefaultFont").actual()["size"]
         self._csv_poll_interval = settings.csv_poll_interval
         self._csv_watcher: tool_watchdog.FileChangeWatcher | None = None
         self._plugin_watcher: tool_watchdog.DirectoryWatcher | None = None
         self._csv_reload_prompt_active = False
         self._update_check_in_progress = False
+        self._last_update_check = "Never"
+        self._density_padding = 8
+        self._frames_with_padding: list[ttk.Labelframe] = []
 
         self._build_layout()
         self._initialize_watchers(self._csv_poll_interval)
@@ -382,204 +432,312 @@ class ToolBuilderApp(tk.Tk):
         else:
             self.after(200, self._maybe_restore_session)
         self.after(400, self._maybe_check_updates_on_launch)
+        self.after(500, self._drain_status_queue)
+        self._set_empty_states()
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        header = ttk.Label(self, text="Tool Builder Wizard", font=("Segoe UI", 18, "bold"))
-        header.grid(row=0, column=0, sticky="w", padx=16, pady=(16, 4))
-        subtitle = ttk.Label(self, text="Build quick CSV analyses using simple form inputs.")
-        subtitle.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
-        theme_frame = ttk.Frame(self)
-        theme_frame.grid(row=0, column=0, sticky="e", padx=16, pady=(16, 4))
-        ttk.Label(theme_frame, text="Theme:").grid(row=0, column=0, sticky="e", padx=(0, 6))
+        header = ttk.Frame(self, padding=(16, 12))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+
+        title = ttk.Label(header, text="Tool Builder Wizard", font=("Segoe UI", 18, "bold"))
+        subtitle = ttk.Label(header, text="Build quick CSV analyses using simple form inputs.")
+        title.grid(row=0, column=0, sticky="w")
+        subtitle.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        controls = ttk.Frame(header)
+        controls.grid(row=0, column=1, rowspan=2, sticky="e")
+        ttk.Label(controls, text="Theme:").grid(row=0, column=0, sticky="e", padx=(0, 6))
         theme_combo = ttk.Combobox(
-            theme_frame,
+            controls,
             textvariable=self.theme_var,
-            values=THEME_MODES,
+            values=sorted(ttk.Style().theme_names()),
             state="readonly",
             width=14,
         )
-        theme_combo.grid(row=0, column=1, sticky="e")
+        theme_combo.grid(row=0, column=1, sticky="e", padx=(0, 12))
+        ttk.Label(controls, text="Density:").grid(row=0, column=2, sticky="e", padx=(0, 6))
+        density_combo = ttk.Combobox(
+            controls,
+            textvariable=self.density_var,
+            values=DENSITY_MODES,
+            state="readonly",
+            width=14,
+        )
+        density_combo.grid(row=0, column=3, sticky="e")
 
-        file_frame = ttk.LabelFrame(self, text="1) Load CSV File")
-        file_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=6)
-        file_frame.columnconfigure(1, weight=1)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 6))
 
-        ttk.Label(file_frame, text="CSV Path:").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        self.data_tab = ttk.Frame(self.notebook)
+        self.analyze_tab = ttk.Frame(self.notebook)
+        self.results_tab = ttk.Frame(self.notebook)
+        self.charts_tab = ttk.Frame(self.notebook)
+        self.automation_tab = ttk.Frame(self.notebook)
+        self.plugins_tab = ttk.Frame(self.notebook)
+
+        for tab in [
+            self.data_tab,
+            self.analyze_tab,
+            self.results_tab,
+            self.charts_tab,
+            self.automation_tab,
+            self.plugins_tab,
+        ]:
+            tab.columnconfigure(0, weight=1)
+
+        self.notebook.add(self.data_tab, text="Data")
+        self.notebook.add(self.analyze_tab, text="Analyze")
+        self.notebook.add(self.results_tab, text="Results")
+        self.notebook.add(self.charts_tab, text="Charts")
+        self.notebook.add(self.automation_tab, text="Automation")
+        self.notebook.add(self.plugins_tab, text="Plugins")
+
+        self._build_data_tab()
+        self._build_analyze_tab()
+        self._build_results_tab()
+        self._build_charts_tab()
+        self._build_automation_tab()
+        self._build_plugins_tab()
+
+        status_frame = ttk.Frame(self, padding=(12, 6))
+        status_frame.grid(row=2, column=0, sticky="ew")
+        status_frame.columnconfigure(0, weight=1)
+        status_label = ttk.Label(status_frame, textvariable=self.status_var)
+        status_label.grid(row=0, column=0, sticky="w")
+        warning_label = ttk.Label(status_frame, textvariable=self.warning_var, foreground="#b54700")
+        warning_label.grid(row=1, column=0, sticky="w")
+        details_btn = ttk.Button(status_frame, text="Details…", command=self._open_diagnostics)
+        details_btn.grid(row=0, column=1, rowspan=2, sticky="e")
+
+        Tooltip(theme_combo, "Switch the Tk/ttk theme.")
+        Tooltip(density_combo, "Adjust layout density and font size.")
+        Tooltip(details_btn, "Open diagnostics for optional dependencies and watchers.")
+
+        self.theme_var.trace_add("write", lambda *_args: self._apply_theme())
+        self.density_var.trace_add("write", lambda *_args: self._apply_density())
+        self._apply_theme()
+        self._apply_density()
+        self._reload_plugins()
+
+        self.column_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
+        self.group_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
+        self.operation_combo.bind("<<ComboboxSelected>>", lambda _event: self._validate_inputs())
+        self.filter_column_combo.bind("<<ComboboxSelected>>", lambda _event: self._validate_inputs())
+        self.merge_mode_var.trace_add("write", lambda *_args: self._validate_inputs())
+        self.merge_key_var.trace_add("write", lambda *_args: self._validate_inputs())
+        self.filter_value_var.trace_add("write", lambda *_args: self._validate_inputs())
+        self.csv_path_var.trace_add("write", lambda *_args: self._validate_inputs())
+        self.chart_type_var.trace_add("write", lambda *_args: self._render_chart())
+        self.chart_column_var.trace_add("write", lambda *_args: self._render_chart())
+
+    def _add_labelframe(self, parent: ttk.Frame, title: str, row: int) -> ttk.Labelframe:
+        frame = ttk.Labelframe(parent, text=title, padding=(10, 8))
+        frame.grid(row=row, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        frame.columnconfigure(0, weight=1)
+        self._frames_with_padding.append(frame)
+        return frame
+
+    def _build_data_tab(self) -> None:
+        self.data_tab.rowconfigure(1, weight=1)
+
+        file_frame = self._add_labelframe(self.data_tab, "Load CSV Files", 0)
+        for col in range(4):
+            file_frame.columnconfigure(col, weight=1)
+        ttk.Label(file_frame, text="CSV Path:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         csv_entry = ttk.Entry(file_frame, textvariable=self.csv_path_var)
-        csv_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=8)
+        csv_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=4, pady=4)
         browse_btn = ttk.Button(file_frame, text="Browse", command=self._browse_csv)
-        browse_btn.grid(row=0, column=2, sticky="ew", padx=8, pady=8)
+        browse_btn.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
         browse_multi_btn = ttk.Button(file_frame, text="Browse Multiple", command=self._browse_csvs)
-        browse_multi_btn.grid(row=0, column=3, sticky="ew", padx=8, pady=8)
+        browse_multi_btn.grid(row=1, column=3, sticky="ew", padx=4, pady=4)
         load_btn = ttk.Button(file_frame, text="Load", command=self._load_csv_from_entry)
-        load_btn.grid(row=0, column=4, sticky="ew", padx=8, pady=8)
+        load_btn.grid(row=2, column=3, sticky="ew", padx=4, pady=4)
 
-        ttk.Label(file_frame, text="Merge Mode:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        ttk.Label(file_frame, text="Merge Mode:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         merge_mode_combo = ttk.Combobox(
             file_frame,
             textvariable=self.merge_mode_var,
             values=MERGE_MODES,
             state="readonly",
         )
-        merge_mode_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=6)
-        ttk.Label(file_frame, text="Join Key:").grid(row=1, column=2, sticky="w", padx=8, pady=6)
+        merge_mode_combo.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Label(file_frame, text="Join Key:").grid(row=1, column=2, sticky="w", padx=4, pady=4)
         join_key_entry = ttk.Entry(file_frame, textvariable=self.merge_key_var)
-        join_key_entry.grid(row=1, column=3, sticky="ew", padx=8, pady=6)
+        join_key_entry.grid(row=1, column=3, sticky="ew", padx=4, pady=4)
 
-        preview_frame = ttk.LabelFrame(self, text="2) Preview Data")
-        preview_frame.grid(row=3, column=0, sticky="nsew", padx=16, pady=6)
-        preview_frame.columnconfigure(0, weight=1)
+        preview_frame = self._add_labelframe(self.data_tab, "Preview", 1)
         preview_frame.rowconfigure(0, weight=1)
-
-        self.preview_text = tk.Text(preview_frame, height=6, wrap="none")
+        preview_frame.columnconfigure(0, weight=1)
+        self.preview_text = tk.Text(preview_frame, height=10, wrap="none")
         preview_scroll = ttk.Scrollbar(preview_frame, command=self.preview_text.yview)
         self.preview_text.configure(yscrollcommand=preview_scroll.set)
-        self.preview_text.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
-        preview_scroll.grid(row=0, column=1, sticky="ns", pady=8)
+        self.preview_text.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        preview_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 4), pady=4)
 
-        config_frame = ttk.LabelFrame(self, text="3) Configure Analysis")
-        config_frame.grid(row=4, column=0, sticky="nsew", padx=16, pady=6)
-        config_frame.columnconfigure(0, weight=1)
-        config_frame.columnconfigure(1, weight=1)
-        config_frame.columnconfigure(2, weight=1)
+        Tooltip(browse_btn, "Browse for a CSV file.")
+        Tooltip(browse_multi_btn, "Browse and select multiple CSV files.")
+        Tooltip(load_btn, "Load the selected CSV file.")
+        Tooltip(merge_mode_combo, "Pick how to combine multiple files.")
+        Tooltip(join_key_entry, "Column name to join on when merging side-by-side.")
 
-        ttk.Label(config_frame, text="Select Columns:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
-        self.column_listbox = tk.Listbox(config_frame, selectmode=tk.MULTIPLE, height=6)
-        self.column_listbox.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+    def _build_analyze_tab(self) -> None:
+        self.analyze_tab.rowconfigure(1, weight=1)
+        self._analysis_widgets: list[tk.Widget] = []
+        if not PANDAS_AVAILABLE:
+            banner_frame = ttk.Frame(self.analyze_tab)
+            banner_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+            banner_frame.columnconfigure(0, weight=1)
+            banner = ttk.Label(
+                banner_frame,
+                text="Optional features disabled: pandas is not installed. You can still run COUNT analyses.",
+                foreground="#b54700",
+                padding=(12, 6),
+            )
+            banner.grid(row=0, column=0, sticky="w")
+            install_btn = ttk.Button(banner_frame, text="Install optional features", command=self._open_install_help)
+            install_btn.grid(row=0, column=1, sticky="e", padx=(12, 0))
 
-        ttk.Label(config_frame, text="Group By:").grid(row=0, column=1, sticky="w", padx=8, pady=(8, 4))
-        self.group_listbox = tk.Listbox(config_frame, selectmode=tk.MULTIPLE, height=6)
-        self.group_listbox.grid(row=1, column=1, sticky="nsew", padx=8, pady=(0, 8))
+        columns_frame = self._add_labelframe(self.analyze_tab, "Select Columns", 1)
+        columns_frame.columnconfigure(0, weight=1)
+        columns_frame.columnconfigure(1, weight=1)
+        columns_frame.rowconfigure(1, weight=1)
 
-        ttk.Label(config_frame, text="Operation:").grid(row=0, column=2, sticky="w", padx=8, pady=(8, 4))
-        operation_combo = ttk.Combobox(config_frame, textvariable=self.operation_var, values=OPERATIONS, state="readonly")
-        operation_combo.grid(row=1, column=2, sticky="ew", padx=8, pady=(0, 8))
+        ttk.Label(columns_frame, text="Analyze Columns:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.column_listbox = tk.Listbox(columns_frame, selectmode=tk.MULTIPLE, height=8)
+        self.column_listbox.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        ttk.Label(columns_frame, text="Group By:").grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        self.group_listbox = tk.Listbox(columns_frame, selectmode=tk.MULTIPLE, height=8)
+        self.group_listbox.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
 
-        filter_frame = ttk.LabelFrame(self, text="Optional Filter")
-        filter_frame.grid(row=5, column=0, sticky="ew", padx=16, pady=6)
-        filter_frame.columnconfigure(1, weight=1)
+        operation_frame = self._add_labelframe(self.analyze_tab, "Operation", 2)
+        operation_frame.columnconfigure(1, weight=1)
+        ttk.Label(operation_frame, text="Operation:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.operation_combo = ttk.Combobox(
+            operation_frame,
+            textvariable=self.operation_var,
+            values=OPERATIONS,
+            state="readonly",
+        )
+        self.operation_combo.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Label(operation_frame, text="Smart Suggest:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        suggest_btn = ttk.Button(operation_frame, text="Suggest Columns", command=self._smart_suggest)
+        suggest_btn.grid(row=1, column=1, sticky="w", padx=4, pady=4)
 
-        ttk.Label(filter_frame, text="Column:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        filter_frame = self._add_labelframe(self.analyze_tab, "Optional Filter", 3)
+        for col in range(6):
+            filter_frame.columnconfigure(col, weight=1)
+        ttk.Label(filter_frame, text="Column:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.filter_column_combo = ttk.Combobox(filter_frame, textvariable=self.filter_column_var, state="readonly")
-        self.filter_column_combo.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
-
-        ttk.Label(filter_frame, text="Operator:").grid(row=0, column=2, sticky="w", padx=8, pady=6)
+        self.filter_column_combo.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Label(filter_frame, text="Operator:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
         operator_combo = ttk.Combobox(filter_frame, textvariable=self.filter_operator_var, values=FILTER_OPERATORS, state="readonly")
-        operator_combo.grid(row=0, column=3, sticky="ew", padx=8, pady=6)
-
-        ttk.Label(filter_frame, text="Value:").grid(row=0, column=4, sticky="w", padx=8, pady=6)
+        operator_combo.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
+        ttk.Label(filter_frame, text="Value:").grid(row=0, column=4, sticky="w", padx=4, pady=4)
         value_entry = ttk.Entry(filter_frame, textvariable=self.filter_value_var)
-        value_entry.grid(row=0, column=5, sticky="ew", padx=8, pady=6)
+        value_entry.grid(row=0, column=5, sticky="ew", padx=4, pady=4)
         clear_filter_btn = ttk.Button(filter_frame, text="Clear Filter", command=self._clear_filter)
-        clear_filter_btn.grid(row=0, column=6, sticky="ew", padx=8, pady=6)
+        clear_filter_btn.grid(row=1, column=5, sticky="e", padx=4, pady=4)
 
-        action_frame = ttk.Frame(self)
-        action_frame.grid(row=6, column=0, sticky="ew", padx=16, pady=(6, 2))
-        action_frame.columnconfigure(0, weight=1)
+        action_frame = self._add_labelframe(self.analyze_tab, "Actions", 4)
+        for col in range(4):
+            action_frame.columnconfigure(col, weight=1)
+        self.run_btn = ttk.Button(action_frame, text="Run Analysis", command=self._run_analysis)
+        self.run_btn.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        self.save_btn = ttk.Button(action_frame, text="Save Results", command=self._save_results)
+        self.save_btn.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        self.copy_btn = ttk.Button(action_frame, text="Copy Results", command=self._copy_results)
+        self.copy_btn.grid(row=0, column=2, sticky="ew", padx=4, pady=4)
+        self.clear_btn = ttk.Button(action_frame, text="Clear Results", command=self._clear_results)
+        self.clear_btn.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
 
-        run_btn = ttk.Button(action_frame, text="Run Analysis", command=self._run_analysis)
-        run_btn.grid(row=0, column=0, sticky="w", padx=4)
-        save_btn = ttk.Button(action_frame, text="Save Results", command=self._save_results)
-        save_btn.grid(row=0, column=1, sticky="w", padx=4)
-        copy_btn = ttk.Button(action_frame, text="Copy Results", command=self._copy_results)
-        copy_btn.grid(row=0, column=2, sticky="w", padx=4)
-        suggest_btn = ttk.Button(action_frame, text="Smart Suggest", command=self._smart_suggest)
-        suggest_btn.grid(row=0, column=3, sticky="w", padx=4)
         recipe_save_btn = ttk.Button(action_frame, text="Save Recipe", command=self._save_recipe)
-        recipe_save_btn.grid(row=0, column=4, sticky="w", padx=4)
+        recipe_save_btn.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
         recipe_load_btn = ttk.Button(action_frame, text="Load Recipe", command=self._load_recipe)
-        recipe_load_btn.grid(row=0, column=5, sticky="w", padx=4)
+        recipe_load_btn.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
         batch_btn = ttk.Button(action_frame, text="Run Recipe Batch", command=self._run_recipe_batch)
-        batch_btn.grid(row=0, column=6, sticky="w", padx=4)
-        clear_btn = ttk.Button(action_frame, text="Clear Results", command=self._clear_results)
-        clear_btn.grid(row=0, column=7, sticky="w", padx=4)
-        save_session_btn = ttk.Button(action_frame, text="Save Session", command=self._save_session)
-        save_session_btn.grid(row=1, column=0, sticky="w", padx=4, pady=(6, 0))
-        load_session_btn = ttk.Button(action_frame, text="Load Session", command=self._load_session)
-        load_session_btn.grid(row=1, column=1, sticky="w", padx=4, pady=(6, 0))
-        ask_ai_btn = ttk.Button(action_frame, text="Ask AI", command=self._explain_data)
-        ask_ai_btn.grid(row=1, column=2, sticky="w", padx=4, pady=(6, 0))
-        share_btn = ttk.Button(action_frame, text="Share Analysis", command=self._share_analysis)
-        share_btn.grid(row=1, column=3, sticky="w", padx=4, pady=(6, 0))
+        batch_btn.grid(row=1, column=2, sticky="ew", padx=4, pady=4)
 
-        plugin_frame = ttk.LabelFrame(self, text="Plugin Tools")
-        plugin_frame.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 6))
-        plugin_frame.columnconfigure(1, weight=1)
-        ttk.Label(plugin_frame, text="Plugin:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        self.plugin_combo = ttk.Combobox(plugin_frame, textvariable=self.plugin_var, state="readonly", width=30)
-        self.plugin_combo.grid(row=0, column=1, sticky="w", padx=8, pady=6)
-        plugin_run_btn = ttk.Button(plugin_frame, text="Run Plugin", command=self._run_plugin)
-        plugin_run_btn.grid(row=0, column=2, sticky="w", padx=8, pady=6)
-        plugin_reload_btn = ttk.Button(plugin_frame, text="Reload Plugins", command=self._reload_plugins)
-        plugin_reload_btn.grid(row=0, column=3, sticky="w", padx=8, pady=6)
+        Tooltip(self.column_listbox, "Choose one or more columns to analyze.")
+        Tooltip(self.group_listbox, "Optional: group results by these columns.")
+        Tooltip(self.operation_combo, "Select the analysis operation to run.")
+        Tooltip(self.filter_column_combo, "Optional: filter rows by a column.")
+        Tooltip(operator_combo, "Comparison operator for filters.")
+        Tooltip(value_entry, "Value to compare against the filter column.")
+        Tooltip(self.run_btn, "Run the configured analysis.")
+        Tooltip(self.save_btn, "Save results to CSV or TXT.")
+        Tooltip(self.copy_btn, "Copy results to clipboard for Excel/email.")
+        Tooltip(self.clear_btn, "Clear the current results.")
+        Tooltip(suggest_btn, "Suggest useful groupings and highlight frequent values.")
+        Tooltip(recipe_save_btn, "Save current configuration as a recipe JSON.")
+        Tooltip(recipe_load_btn, "Load a saved recipe JSON.")
+        Tooltip(batch_btn, "Run a recipe across a folder of CSVs.")
+        self._analysis_widgets.extend(
+            [
+                self.column_listbox,
+                self.group_listbox,
+                self.operation_combo,
+                self.filter_column_combo,
+                operator_combo,
+                value_entry,
+                clear_filter_btn,
+                self.run_btn,
+                suggest_btn,
+                recipe_save_btn,
+                recipe_load_btn,
+                batch_btn,
+            ]
+        )
+        if not PANDAS_AVAILABLE:
+            self.operation_var.set("COUNT")
+            self.operation_combo.configure(values=["COUNT"])
 
-        live_frame = ttk.LabelFrame(self, text="Live Updates & Session")
-        live_frame.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 6))
-        for column in range(4):
-            live_frame.columnconfigure(column, weight=1)
+    def _build_results_tab(self) -> None:
+        self.results_tab.rowconfigure(0, weight=1)
+        results_frame = self._add_labelframe(self.results_tab, "Results", 0)
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
 
-        auto_reload_csv_check = ttk.Checkbutton(
-            live_frame,
-            text="Auto-reload CSV on change",
-            variable=self.auto_reload_csv_var,
-        )
-        auto_reload_csv_check.grid(row=0, column=0, sticky="w", padx=8, pady=4)
-        self.silent_reload_check = ttk.Checkbutton(
-            live_frame,
-            text="Silent CSV reload",
-            variable=self.silent_csv_reload_var,
-        )
-        self.silent_reload_check.grid(row=0, column=1, sticky="w", padx=8, pady=4)
-        auto_reload_plugins_check = ttk.Checkbutton(
-            live_frame,
-            text="Auto-reload plugins",
-            variable=self.auto_reload_plugins_var,
-        )
-        auto_reload_plugins_check.grid(row=0, column=2, sticky="w", padx=8, pady=4)
-        restore_session_check = ttk.Checkbutton(
-            live_frame,
-            text="Restore last session",
-            variable=self.restore_session_var,
-        )
-        restore_session_check.grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        auto_save_session_check = ttk.Checkbutton(
-            live_frame,
-            text="Auto-save session on exit",
-            variable=self.auto_save_session_var,
-        )
-        auto_save_session_check.grid(row=1, column=1, sticky="w", padx=8, pady=4)
-        check_updates_check = ttk.Checkbutton(
-            live_frame,
-            text="Check updates on launch",
-            variable=self.check_updates_var,
-        )
-        check_updates_check.grid(row=1, column=2, sticky="w", padx=8, pady=4)
-        check_updates_btn = ttk.Button(live_frame, text="Check for Updates", command=self._check_for_updates)
-        check_updates_btn.grid(row=1, column=3, sticky="e", padx=8, pady=4)
-
-        result_frame = ttk.LabelFrame(self, text="4) Results")
-        result_frame.grid(row=9, column=0, sticky="nsew", padx=16, pady=6)
-        result_frame.columnconfigure(0, weight=1)
-        result_frame.rowconfigure(0, weight=1)
-        results_notebook = ttk.Notebook(result_frame)
-        results_notebook.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        result_frame.rowconfigure(0, weight=1)
-
-        table_frame = ttk.Frame(results_notebook)
-        table_frame.columnconfigure(0, weight=1)
-        table_frame.rowconfigure(0, weight=1)
-        self.results_text = tk.Text(table_frame, wrap="none")
-        results_scroll = ttk.Scrollbar(table_frame, command=self.results_text.yview)
+        self.results_text = tk.Text(results_frame, wrap="none", height=16)
+        results_scroll = ttk.Scrollbar(results_frame, command=self.results_text.yview)
         self.results_text.configure(yscrollcommand=results_scroll.set)
-        self.results_text.grid(row=0, column=0, sticky="nsew")
-        results_scroll.grid(row=0, column=1, sticky="ns")
+        self.results_text.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        results_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 4), pady=4)
 
-        chart_frame = ttk.Frame(results_notebook)
-        chart_controls = ttk.Frame(chart_frame)
-        chart_controls.pack(anchor="w", pady=(0, 8))
-        ttk.Label(chart_controls, text="Chart Type:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        helper_frame = self._add_labelframe(self.results_tab, "Summary", 1)
+        helper_frame.columnconfigure(0, weight=1)
+        ask_ai_btn = ttk.Button(helper_frame, text="Explain Data", command=self._explain_data)
+        ask_ai_btn.grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        share_btn = ttk.Button(helper_frame, text="Share Analysis", command=self._share_analysis)
+        share_btn.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+
+        Tooltip(ask_ai_btn, "Summarize the current data in natural language.")
+        Tooltip(share_btn, "Export a shareable ZIP with results and session files.")
+
+    def _build_charts_tab(self) -> None:
+        self.charts_tab.rowconfigure(1, weight=1)
+        if not MATPLOTLIB_AVAILABLE:
+            banner_frame = ttk.Frame(self.charts_tab)
+            banner_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+            banner_frame.columnconfigure(0, weight=1)
+            banner = ttk.Label(
+                banner_frame,
+                text="Charts are disabled because matplotlib is not installed.",
+                foreground="#b54700",
+                padding=(12, 6),
+            )
+            banner.grid(row=0, column=0, sticky="w")
+            install_btn = ttk.Button(banner_frame, text="Install optional features", command=self._open_install_help)
+            install_btn.grid(row=0, column=1, sticky="e", padx=(12, 0))
+            self.notebook.tab(self.charts_tab, state="disabled")
+            return
+
+        chart_controls = self._add_labelframe(self.charts_tab, "Chart Controls", 0)
+        chart_controls.columnconfigure(1, weight=1)
+        ttk.Label(chart_controls, text="Chart Type:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         chart_type_combo = ttk.Combobox(
             chart_controls,
             textvariable=self.chart_type_var,
@@ -587,62 +745,92 @@ class ToolBuilderApp(tk.Tk):
             state="readonly",
             width=10,
         )
-        chart_type_combo.grid(row=0, column=1, sticky="w")
-        ttk.Label(chart_controls, text="Value Column:").grid(row=0, column=2, sticky="w", padx=(12, 6))
+        chart_type_combo.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        ttk.Label(chart_controls, text="Value Column:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
         self.chart_column_combo = ttk.Combobox(
             chart_controls,
             textvariable=self.chart_column_var,
             state="readonly",
             width=18,
         )
-        self.chart_column_combo.grid(row=0, column=3, sticky="w")
+        self.chart_column_combo.grid(row=0, column=3, sticky="w", padx=4, pady=4)
         chart_edit_btn = ttk.Button(chart_controls, text="Edit Chart", command=self._open_chart_editor)
-        chart_edit_btn.grid(row=0, column=4, sticky="w", padx=(12, 4))
+        chart_edit_btn.grid(row=0, column=4, sticky="w", padx=4, pady=4)
         chart_export_btn = ttk.Button(chart_controls, text="Export PNG", command=self._export_chart_dialog)
-        chart_export_btn.grid(row=0, column=5, sticky="w")
+        chart_export_btn.grid(row=0, column=5, sticky="w", padx=4, pady=4)
+
+        chart_frame = self._add_labelframe(self.charts_tab, "Preview", 1)
+        chart_frame.columnconfigure(0, weight=1)
+        chart_frame.rowconfigure(0, weight=1)
         self.chart_canvas = tk.Canvas(chart_frame, height=320, background="white")
-        self.chart_canvas.pack(fill="both", expand=True)
+        self.chart_canvas.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
-        results_notebook.add(table_frame, text="Table")
-        results_notebook.add(chart_frame, text="Chart Preview")
-
-        status_frame = ttk.Frame(self)
-        status_frame.grid(row=10, column=0, sticky="ew", padx=16, pady=(4, 12))
-        status_label = ttk.Label(status_frame, textvariable=self.status_var)
-        status_label.pack(anchor="w")
-        warning_label = tk.Label(status_frame, textvariable=self.warning_var, fg="#b54700")
-        warning_label.pack(anchor="w")
-
-        Tooltip(browse_btn, "Browse for a CSV file.")
-        Tooltip(browse_multi_btn, "Browse and select multiple CSV files.")
-        Tooltip(load_btn, "Load the selected CSV file.")
-        Tooltip(merge_mode_combo, "Pick how to combine multiple files.")
-        Tooltip(join_key_entry, "Column name to join on when merging side-by-side.")
-        Tooltip(self.column_listbox, "Choose one or more columns to analyze.")
-        Tooltip(self.group_listbox, "Optional: group results by these columns.")
-        Tooltip(operation_combo, "Select the analysis operation to run.")
-        Tooltip(self.filter_column_combo, "Optional: filter rows by a column.")
-        Tooltip(operator_combo, "Comparison operator for filters.")
-        Tooltip(value_entry, "Value to compare against the filter column.")
-        Tooltip(run_btn, "Run the configured analysis.")
-        Tooltip(save_btn, "Save results to CSV or TXT.")
-        Tooltip(copy_btn, "Copy results to clipboard for Excel/email.")
-        Tooltip(suggest_btn, "Suggest useful groupings and highlight frequent values.")
-        Tooltip(recipe_save_btn, "Save current configuration as a recipe JSON.")
-        Tooltip(recipe_load_btn, "Load a saved recipe JSON.")
-        Tooltip(batch_btn, "Run a recipe across a folder of CSVs.")
-        Tooltip(save_session_btn, "Save the current session to a .moitsession.json file.")
-        Tooltip(load_session_btn, "Load a saved .moitsession.json session file.")
-        Tooltip(ask_ai_btn, "Summarize the current data in natural language.")
-        Tooltip(share_btn, "Export a shareable ZIP with results and session files.")
-        Tooltip(theme_combo, "Switch theme and typography modes.")
         Tooltip(chart_type_combo, "Pick a chart type for preview.")
         Tooltip(self.chart_column_combo, "Choose which column to chart.")
         Tooltip(chart_edit_btn, "Adjust chart labels, colors, and display options.")
         Tooltip(chart_export_btn, "Export the current chart preview as a PNG image.")
-        Tooltip(self.plugin_combo, "Select a plugin from the plugins folder.")
-        Tooltip(plugin_run_btn, "Run the selected plugin against the loaded data.")
-        Tooltip(plugin_reload_btn, "Reload plugins from the plugins folder.")
+
+    def _build_automation_tab(self) -> None:
+        automation_frame = self._add_labelframe(self.automation_tab, "Automation Controls", 0)
+        for col in range(2):
+            automation_frame.columnconfigure(col, weight=1)
+        auto_reload_csv_check = ttk.Checkbutton(
+            automation_frame,
+            text="Auto-reload CSV on change",
+            variable=self.auto_reload_csv_var,
+        )
+        auto_reload_csv_check.grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.silent_reload_check = ttk.Checkbutton(
+            automation_frame,
+            text="Silent CSV reload",
+            variable=self.silent_csv_reload_var,
+        )
+        self.silent_reload_check.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        auto_reload_plugins_check = ttk.Checkbutton(
+            automation_frame,
+            text="Auto-reload plugins",
+            variable=self.auto_reload_plugins_var,
+        )
+        auto_reload_plugins_check.grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        restore_session_check = ttk.Checkbutton(
+            automation_frame,
+            text="Restore last session",
+            variable=self.restore_session_var,
+        )
+        restore_session_check.grid(row=1, column=1, sticky="w", padx=4, pady=4)
+        auto_save_session_check = ttk.Checkbutton(
+            automation_frame,
+            text="Auto-save session on exit",
+            variable=self.auto_save_session_var,
+        )
+        auto_save_session_check.grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        check_updates_check = ttk.Checkbutton(
+            automation_frame,
+            text="Check updates on launch",
+            variable=self.check_updates_var,
+        )
+        check_updates_check.grid(row=2, column=1, sticky="w", padx=4, pady=4)
+        safe_mode_check = ttk.Checkbutton(
+            automation_frame,
+            text="Safe mode (disable background watchers)",
+            variable=self.safe_mode_var,
+        )
+        safe_mode_check.grid(row=3, column=0, sticky="w", padx=4, pady=4)
+
+        update_frame = self._add_labelframe(self.automation_tab, "Update Checks", 1)
+        update_frame.columnconfigure(1, weight=1)
+        ttk.Label(update_frame, text="Last checked:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.last_checked_label = ttk.Label(update_frame, text=self._last_update_check)
+        self.last_checked_label.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        check_updates_btn = ttk.Button(update_frame, text="Run now", command=self._check_for_updates)
+        check_updates_btn.grid(row=0, column=2, sticky="e", padx=4, pady=4)
+
+        session_frame = self._add_labelframe(self.automation_tab, "Session Tools", 2)
+        save_session_btn = ttk.Button(session_frame, text="Save Session", command=self._save_session)
+        save_session_btn.grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        load_session_btn = ttk.Button(session_frame, text="Load Session", command=self._load_session)
+        load_session_btn.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+
         Tooltip(auto_reload_csv_check, "Watch the loaded CSV files for changes and reload them.")
         Tooltip(self.silent_reload_check, "Reload CSV files automatically without prompting.")
         Tooltip(auto_reload_plugins_check, "Watch the plugins folder for new or updated plugins.")
@@ -650,23 +838,30 @@ class ToolBuilderApp(tk.Tk):
         Tooltip(auto_save_session_check, "Save session state when closing the Tool Builder.")
         Tooltip(check_updates_check, "Check for updates automatically when launching the tool.")
         Tooltip(check_updates_btn, "Check GitHub for a newer Tool Builder version.")
+        Tooltip(safe_mode_check, "Disable file watchers for troubleshooting.")
+        Tooltip(save_session_btn, "Save the current session to a .moitsession.json file.")
+        Tooltip(load_session_btn, "Load a saved .moitsession.json session file.")
 
-        self.rowconfigure(9, weight=1)
+    def _build_plugins_tab(self) -> None:
+        plugin_frame = self._add_labelframe(self.plugins_tab, "Plugin Tools", 0)
+        plugin_frame.columnconfigure(1, weight=1)
+        self.plugin_status_label = ttk.Label(plugin_frame, text="")
+        self.plugin_status_label.grid(row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 8))
+        ttk.Label(plugin_frame, text="Plugin:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        self.plugin_combo = ttk.Combobox(plugin_frame, textvariable=self.plugin_var, state="readonly", width=30)
+        self.plugin_combo.grid(row=1, column=1, sticky="w", padx=4, pady=4)
+        self.plugin_empty_label = ttk.Label(plugin_frame, text="")
+        self.plugin_empty_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 4))
+        plugin_run_btn = ttk.Button(plugin_frame, text="Run Plugin", command=self._run_plugin)
+        plugin_run_btn.grid(row=1, column=2, sticky="w", padx=4, pady=4)
+        plugin_reload_btn = ttk.Button(plugin_frame, text="Reload Plugins", command=self._reload_plugins)
+        plugin_reload_btn.grid(row=2, column=2, sticky="w", padx=4, pady=4)
+        install_btn = ttk.Button(plugin_frame, text="Install optional features", command=self._open_install_help)
+        install_btn.grid(row=3, column=0, sticky="w", padx=4, pady=4)
 
-        self.column_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
-        self.group_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
-        operation_combo.bind("<<ComboboxSelected>>", lambda _event: self._validate_inputs())
-        self.filter_column_combo.bind("<<ComboboxSelected>>", lambda _event: self._validate_inputs())
-        operator_combo.bind("<<ComboboxSelected>>", lambda _event: self._validate_inputs())
-        self.merge_mode_var.trace_add("write", lambda *_args: self._validate_inputs())
-        self.merge_key_var.trace_add("write", lambda *_args: self._validate_inputs())
-        self.filter_value_var.trace_add("write", lambda *_args: self._validate_inputs())
-        self.csv_path_var.trace_add("write", lambda *_args: self._validate_inputs())
-        self.chart_type_var.trace_add("write", lambda *_args: self._render_chart())
-        self.chart_column_var.trace_add("write", lambda *_args: self._render_chart())
-        self.theme_var.trace_add("write", lambda *_args: self._apply_theme())
-        self._apply_theme()
-        self._reload_plugins()
+        Tooltip(self.plugin_combo, "Select a plugin from the plugins folder.")
+        Tooltip(plugin_run_btn, "Run the selected plugin against the loaded data.")
+        Tooltip(plugin_reload_btn, "Reload plugins from the plugins folder.")
 
     def _browse_csv(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
@@ -691,8 +886,8 @@ class ToolBuilderApp(tk.Tk):
 
     def _load_csv(self, paths: list[str]) -> None:
         try:
-            self.df = merge_dataframes(paths, self.merge_mode_var.get(), self.merge_key_var.get().strip() or None)
-        except (FileNotFoundError, ValueError) as exc:
+            self.data = load_data(paths, self.merge_mode_var.get(), self.merge_key_var.get().strip() or None)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
             messagebox.showerror("CSV Load Error", str(exc))
             self.status_var.set(f"Error: {exc}")
             return
@@ -700,11 +895,17 @@ class ToolBuilderApp(tk.Tk):
         self.csv_paths = paths
         self._update_csv_watch(paths)
         self.preview_text.delete("1.0", tk.END)
-        self.preview_text.insert(tk.END, preview_dataframe(self.df))
+        self.preview_text.insert(tk.END, preview_data(self.data))
         self._populate_columns()
-        self.status_var.set(f"Loaded {len(self.df)} rows and {len(self.df.columns)} columns.")
+        self._set_analyze_state(True)
+        total_rows = len(self.data) if PANDAS_AVAILABLE and pd is not None and isinstance(self.data, pd.DataFrame) else len(self.data.rows)
+        total_columns = len(self.data.columns) if isinstance(self.data, csv_engine.CSVTable) else len(self.data.columns)
+        self.status_var.set(f"Loaded {total_rows} rows and {total_columns} columns.")
         self._validate_inputs()
-        self._update_chart_options(pd.DataFrame())
+        if PANDAS_AVAILABLE and pd is not None and isinstance(self.data, pd.DataFrame):
+            self._update_chart_options(pd.DataFrame())
+        else:
+            self._update_chart_options(None)
 
     def _resolve_csv_paths(self) -> list[str]:
         raw = self.csv_path_var.get().strip()
@@ -714,7 +915,12 @@ class ToolBuilderApp(tk.Tk):
         return paths
 
     def _populate_columns(self) -> None:
-        columns = list(self.df.columns) if self.df is not None else []
+        if PANDAS_AVAILABLE and pd is not None and isinstance(self.data, pd.DataFrame):
+            columns = list(self.data.columns)
+        elif isinstance(self.data, csv_engine.CSVTable):
+            columns = list(self.data.columns)
+        else:
+            columns = []
         for listbox in (self.column_listbox, self.group_listbox):
             listbox.delete(0, tk.END)
             for col in columns:
@@ -750,14 +956,16 @@ class ToolBuilderApp(tk.Tk):
             join_key = self.merge_key_var.get().strip()
             if not join_key:
                 warnings.append("Join key is required for side-by-side merges.")
-            elif self.df is not None and join_key not in self.df.columns:
-                warnings.append(f"Join key '{join_key}' not found in loaded data.")
-        if self.df is not None:
+            elif self.data is not None:
+                data_columns = self.data.columns if isinstance(self.data, csv_engine.CSVTable) else self.data.columns
+                if join_key not in data_columns:
+                    warnings.append(f"Join key '{join_key}' not found in loaded data.")
+        if self.data is not None:
             selected_columns = self._selected_listbox_values(self.column_listbox)
             if not selected_columns:
                 warnings.append("Select at least one column to analyze.")
-            if self.operation_var.get() in NUMERIC_OPERATIONS and selected_columns:
-                non_numeric = _columns_missing_numeric_values(self.df, selected_columns)
+            if PANDAS_AVAILABLE and pd is not None and self.operation_var.get() in NUMERIC_OPERATIONS and selected_columns:
+                non_numeric = _columns_missing_numeric_values(self.data, selected_columns)
                 if non_numeric:
                     warnings.append(f"Non-numeric columns selected: {', '.join(non_numeric)}.")
         filter_value = self.filter_value_var.get().strip()
@@ -766,40 +974,42 @@ class ToolBuilderApp(tk.Tk):
                 float(filter_value)
             except ValueError:
                 warnings.append("Filter value should be numeric for comparison operators.")
+        if not PANDAS_AVAILABLE and _requires_pandas(self.operation_var.get()):
+            warnings.append("This operation requires pandas (optional dependency).")
         self.warning_var.set("Warnings: " + " ".join(warnings) if warnings else "")
 
     def _apply_theme(self) -> None:
         style = ttk.Style(self)
         theme = self.theme_var.get()
+        if theme in style.theme_names():
+            style.theme_use(theme)
+
+    def _apply_density(self) -> None:
+        density = self.density_var.get()
         default_font = tkfont.nametofont("TkDefaultFont")
-        text_bg = "white"
-        text_fg = "black"
-        if theme == "Dark":
-            style.configure(".", background="#1f1f1f", foreground="#f2f2f2")
-            style.configure("TLabel", background="#1f1f1f", foreground="#f2f2f2")
-            style.configure("TLabelframe", background="#1f1f1f", foreground="#f2f2f2")
-            style.configure("TLabelframe.Label", background="#1f1f1f", foreground="#f2f2f2")
-            text_bg = "#2a2a2a"
-            text_fg = "#f2f2f2"
-            default_font.configure(size=self._base_font_size)
-        elif theme == "Large Fonts":
-            style.configure(".", background="", foreground="")
+        if density == "Compact":
+            self._density_padding = 6
+            default_font.configure(size=max(9, self._base_font_size - 1))
+        elif density == "Large text":
+            self._density_padding = 10
             default_font.configure(size=self._base_font_size + 2)
-        elif theme == "Compact":
-            style.configure(".", background="", foreground="")
-            default_font.configure(size=max(8, self._base_font_size - 2))
         else:
-            style.configure(".", background="", foreground="")
+            self._density_padding = 8
             default_font.configure(size=self._base_font_size)
-        self.results_text.configure(background=text_bg, foreground=text_fg)
-        self.preview_text.configure(background=text_bg, foreground=text_fg)
-        self.chart_canvas.configure(background="white" if theme != "Dark" else "#2a2a2a")
+        for frame in self._frames_with_padding:
+            frame.configure(padding=(self._density_padding, self._density_padding - 2))
 
     def _smart_suggest(self) -> None:
-        if self.df is None:
+        if not PANDAS_AVAILABLE or pd is None:
+            messagebox.showinfo(
+                "Suggestions Disabled",
+                "Smart suggestions require pandas. Install optional dependencies to enable them.",
+            )
+            return
+        if self.data is None or not isinstance(self.data, pd.DataFrame):
             messagebox.showwarning("No Data", "Load a CSV file before requesting suggestions.")
             return
-        suggestions = suggest_columns(self.df)
+        suggestions = suggest_columns(self.data)
         group_by = suggestions.get("group_by", [])
         numeric = suggestions.get("numeric", [])
         top_patterns = suggestions.get("top_patterns", {})
@@ -816,7 +1026,13 @@ class ToolBuilderApp(tk.Tk):
             lines.append("No suggestions available for the current data.")
         messagebox.showinfo("Smart Suggestions", "\n".join(lines))
 
-    def _update_chart_options(self, result: pd.DataFrame) -> None:
+    def _update_chart_options(self, result: Any | None) -> None:
+        if not MATPLOTLIB_AVAILABLE:
+            return
+        if not PANDAS_AVAILABLE or pd is None or result is None:
+            self.chart_column_combo["values"] = []
+            self.chart_column_var.set("")
+            return
         numeric_columns = result.select_dtypes(include="number").columns.tolist()
         self.chart_column_combo["values"] = numeric_columns
         if numeric_columns:
@@ -859,8 +1075,10 @@ class ToolBuilderApp(tk.Tk):
         return list(sorted_labels), list(sorted_values)
 
     def _render_chart(self) -> None:
+        if not MATPLOTLIB_AVAILABLE:
+            return
         self.chart_canvas.delete("all")
-        if not isinstance(self.last_result, pd.DataFrame):
+        if not (PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame)):
             self.chart_canvas.create_text(10, 10, anchor="nw", text="No chartable data available.")
             return
         result = self.last_result
@@ -975,6 +1193,9 @@ class ToolBuilderApp(tk.Tk):
             )
 
     def _open_chart_editor(self) -> None:
+        if not MATPLOTLIB_AVAILABLE:
+            messagebox.showinfo("Charts Disabled", "Install matplotlib to use chart previews.")
+            return
         editor = tk.Toplevel(self)
         editor.title("Chart Editor")
         editor.geometry("420x360")
@@ -1084,7 +1305,7 @@ class ToolBuilderApp(tk.Tk):
     def _export_chart_png(self, path: str) -> bool:
         if not self._pillow_available():
             return False
-        if not isinstance(self.last_result, pd.DataFrame):
+        if not (PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame)):
             messagebox.showwarning("No Chart", "Run an analysis to generate chart data.")
             return False
         from PIL import Image
@@ -1108,8 +1329,12 @@ class ToolBuilderApp(tk.Tk):
             self.plugin_combo["values"] = names
         if names:
             self.plugin_var.set(names[0])
+            self.plugin_empty_label.config(text="")
         else:
             self.plugin_var.set("")
+            self.plugin_empty_label.config(text="No plugins found. Put .py files in tools/plugins/")
+        status = tool_plugins.plugin_status()
+        self.plugin_status_label.config(text=status.message)
         if hasattr(self, "plugin_var"):
             if status_message:
                 self.status_var.set(status_message)
@@ -1122,6 +1347,8 @@ class ToolBuilderApp(tk.Tk):
         PLUGIN_FOLDER.mkdir(parents=True, exist_ok=True)
         self._csv_watcher = tool_watchdog.FileChangeWatcher([], interval, self._on_csv_files_changed)
         self._plugin_watcher = tool_watchdog.DirectoryWatcher(PLUGIN_FOLDER, interval, self._on_plugins_changed)
+        if self.safe_mode_var.get():
+            return
         if self.auto_reload_csv_var.get():
             self._csv_watcher.start()
         if self.auto_reload_plugins_var.get():
@@ -1131,10 +1358,11 @@ class ToolBuilderApp(tk.Tk):
     def _bind_setting_traces(self) -> None:
         self.auto_reload_csv_var.trace_add("write", lambda *_args: self._handle_csv_watch_toggle())
         self.auto_reload_plugins_var.trace_add("write", lambda *_args: self._handle_plugin_watch_toggle())
+        self.safe_mode_var.trace_add("write", lambda *_args: self._handle_safe_mode_toggle())
 
     def _handle_csv_watch_toggle(self) -> None:
         self._update_silent_reload_state()
-        if not self._csv_watcher:
+        if not self._csv_watcher or self.safe_mode_var.get():
             return
         if self.auto_reload_csv_var.get():
             self._csv_watcher.start()
@@ -1144,7 +1372,7 @@ class ToolBuilderApp(tk.Tk):
             self.status_var.set("CSV auto-reload disabled.")
 
     def _handle_plugin_watch_toggle(self) -> None:
-        if not self._plugin_watcher:
+        if not self._plugin_watcher or self.safe_mode_var.get():
             return
         if self.auto_reload_plugins_var.get():
             self._plugin_watcher.start()
@@ -1153,9 +1381,20 @@ class ToolBuilderApp(tk.Tk):
             self._plugin_watcher.stop()
             self.status_var.set("Plugin auto-reload disabled.")
 
+    def _handle_safe_mode_toggle(self) -> None:
+        if self.safe_mode_var.get():
+            if self._csv_watcher:
+                self._csv_watcher.stop()
+            if self._plugin_watcher:
+                self._plugin_watcher.stop()
+            self.status_var.set("Safe mode enabled: watchers paused.")
+        else:
+            self._initialize_watchers(self._csv_poll_interval)
+            self.status_var.set("Safe mode disabled: watchers active based on settings.")
+
     def _update_silent_reload_state(self) -> None:
         if hasattr(self, "silent_reload_check"):
-            state = "normal" if self.auto_reload_csv_var.get() else "disabled"
+            state = "normal" if self.auto_reload_csv_var.get() and not self.safe_mode_var.get() else "disabled"
             self.silent_reload_check.configure(state=state)
 
     def _update_csv_watch(self, paths: list[str]) -> None:
@@ -1165,12 +1404,14 @@ class ToolBuilderApp(tk.Tk):
     def _on_csv_files_changed(self, changed_paths: list[Path]) -> None:
         if not self.auto_reload_csv_var.get() or not self.csv_paths:
             return
+        if self.safe_mode_var.get():
+            return
         if self._csv_reload_prompt_active:
             return
 
         def prompt_reload() -> None:
             self._csv_reload_prompt_active = False
-            if not self.auto_reload_csv_var.get():
+            if not self.auto_reload_csv_var.get() or self.safe_mode_var.get():
                 return
             if self.silent_csv_reload_var.get():
                 self._reload_current_csv(silent=True)
@@ -1190,7 +1431,7 @@ class ToolBuilderApp(tk.Tk):
             self.status_var.set("CSV auto-reload complete.")
 
     def _on_plugins_changed(self, change: tool_watchdog.DirectoryChange) -> None:
-        if not self.auto_reload_plugins_var.get():
+        if not self.auto_reload_plugins_var.get() or self.safe_mode_var.get():
             return
 
         def reload_plugins() -> None:
@@ -1236,6 +1477,8 @@ class ToolBuilderApp(tk.Tk):
 
     def _handle_update_result(self, result: tool_updater.UpdateCheckResult) -> None:
         self._update_check_in_progress = False
+        self._last_update_check = "Just now"
+        self.last_checked_label.config(text=self._last_update_check)
         if result.status == "up_to_date":
             self.status_var.set(result.message)
             messagebox.showinfo("Update Check", result.message)
@@ -1314,13 +1557,14 @@ class ToolBuilderApp(tk.Tk):
         self.chart_config = tool_sessions.ChartConfig.from_dict(data.get("chart_config", {}))
         self.last_result = tool_sessions.deserialize_last_result(data.get("last_result", {}))
         self.results_text.delete("1.0", tk.END)
-        if isinstance(self.last_result, pd.DataFrame):
+        if PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame):
             self.results_text.insert(tk.END, self.last_result.to_string())
             self._update_chart_options(self.last_result)
             self._render_chart()
+        elif isinstance(self.last_result, csv_engine.CSVTable):
+            self.results_text.insert(tk.END, self.last_result.to_text())
         elif self.last_result is not None:
             self.results_text.insert(tk.END, str(self.last_result))
-            self._render_chart()
         self.status_var.set(source)
         self._validate_inputs()
 
@@ -1332,6 +1576,7 @@ class ToolBuilderApp(tk.Tk):
             silent_csv_reload=self.silent_csv_reload_var.get(),
             auto_reload_plugins=self.auto_reload_plugins_var.get(),
             check_updates_on_launch=self.check_updates_var.get(),
+            safe_mode=self.safe_mode_var.get(),
             csv_poll_interval=self._csv_poll_interval,
         )
         tool_settings.save_settings(tool_settings.default_settings_path(), settings)
@@ -1354,7 +1599,7 @@ class ToolBuilderApp(tk.Tk):
         self.destroy()
 
     def _run_plugin(self) -> None:
-        if self.df is None:
+        if self.data is None:
             messagebox.showwarning("No Data", "Load a CSV file before running plugins.")
             return
         plugin_name = self.plugin_var.get()
@@ -1362,8 +1607,14 @@ class ToolBuilderApp(tk.Tk):
         if plugin is None:
             messagebox.showwarning("Plugin Missing", "Select a valid plugin tool.")
             return
+        if not PANDAS_AVAILABLE:
+            messagebox.showwarning(
+                "Plugin Disabled",
+                "Plugins require pandas. Install optional dependencies to enable plugins.",
+            )
+            return
         try:
-            filtered = apply_filters(self.df, self._current_filters())
+            filtered = apply_filters(self.data, self._current_filters())
         except ValueError as exc:
             messagebox.showerror("Filter Error", str(exc))
             return
@@ -1371,12 +1622,14 @@ class ToolBuilderApp(tk.Tk):
         if not ok:
             messagebox.showerror("Plugin Error", error_text)
             return
-        self.last_result = result if isinstance(result, pd.DataFrame) else str(result)
+        self.last_result = result if PANDAS_AVAILABLE and pd is not None and isinstance(result, pd.DataFrame) else str(result)
         self.results_text.delete("1.0", tk.END)
-        self.results_text.insert(tk.END, self.last_result.to_string() if isinstance(self.last_result, pd.DataFrame) else self.last_result)
-        if isinstance(self.last_result, pd.DataFrame):
+        if PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame):
+            self.results_text.insert(tk.END, self.last_result.to_string())
             self._update_chart_options(self.last_result)
             self._render_chart()
+        else:
+            self.results_text.insert(tk.END, str(self.last_result))
         self.status_var.set(f"Plugin '{plugin.name}' completed.")
 
     def _save_session(self) -> None:
@@ -1400,52 +1653,16 @@ class ToolBuilderApp(tk.Tk):
         self._load_session_from_path(Path(path), source=f"Session loaded from {path}.")
 
     def _explain_data(self) -> None:
-        if self.df is None:
+        if self.data is None:
             messagebox.showwarning("No Data", "Load a CSV file before asking for a summary.")
             return
         summary_text = self._build_data_summary()
         self._show_text_report("Explain This Data", summary_text)
 
     def _build_data_summary(self) -> str:
-        df = self.df
-        if df is None:
-            return "No data available."
-        profiling_available = importlib.util.find_spec("ydata_profiling") is not None
-        if profiling_available:
-            from ydata_profiling import ProfileReport
-
-            profile = ProfileReport(df, minimal=True, progress_bar=False)
-            description = profile.get_description()
-            overview = description.get("overview", {})
-            text_lines = [
-                "Automated Data Summary (ydata-profiling)",
-                f"Rows: {overview.get('n', len(df))}",
-                f"Columns: {overview.get('n_var', len(df.columns))}",
-                "",
-            ]
-            for column, details in description.get("variables", {}).items():
-                common = details.get("top")
-                missing = details.get("n_missing")
-                text_lines.append(f"{column}: top={common}, missing={missing}")
-            return "\n".join(text_lines)
-        profiling_available = importlib.util.find_spec("pandas_profiling") is not None
-        if profiling_available:
-            from pandas_profiling import ProfileReport
-
-            profile = ProfileReport(df, minimal=True, progress_bar=False)
-            description = profile.get_description()
-            overview = description.get("overview", {})
-            text_lines = [
-                "Automated Data Summary (pandas-profiling)",
-                f"Rows: {overview.get('n', len(df))}",
-                f"Columns: {overview.get('n_var', len(df.columns))}",
-                "",
-            ]
-            for column, details in description.get("variables", {}).items():
-                common = details.get("top")
-                missing = details.get("n_missing")
-                text_lines.append(f"{column}: top={common}, missing={missing}")
-            return "\n".join(text_lines)
+        if not (PANDAS_AVAILABLE and pd is not None and isinstance(self.data, pd.DataFrame)):
+            return "Basic summary unavailable without pandas. Install optional dependencies for advanced summaries."
+        df = self.data
         describe = df.describe(include="all").transpose()
         missing_counts = df.isna().sum()
         common_values = []
@@ -1490,9 +1707,11 @@ class ToolBuilderApp(tk.Tk):
         report.transient(self)
         report.grab_set()
         text_frame = ttk.Frame(report)
-        text_frame.pack(fill="both", expand=True, padx=12, pady=12)
+        text_frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         text_frame.rowconfigure(0, weight=1)
         text_frame.columnconfigure(0, weight=1)
+        report.rowconfigure(0, weight=1)
+        report.columnconfigure(0, weight=1)
         report_text = tk.Text(text_frame, wrap="word")
         scroll = ttk.Scrollbar(text_frame, command=report_text.yview)
         report_text.configure(yscrollcommand=scroll.set)
@@ -1509,7 +1728,7 @@ class ToolBuilderApp(tk.Tk):
             self.status_var.set(f"Summary saved to {path}.")
 
         button_frame = ttk.Frame(report)
-        button_frame.pack(pady=(0, 12))
+        button_frame.grid(row=1, column=0, pady=(0, 12))
         save_btn = ttk.Button(button_frame, text="Save Summary", command=save_report)
         save_btn.grid(row=0, column=0, padx=6)
         close_btn = ttk.Button(button_frame, text="Close", command=report.destroy)
@@ -1518,7 +1737,7 @@ class ToolBuilderApp(tk.Tk):
         Tooltip(close_btn, "Close the summary window.")
 
     def _share_analysis(self) -> None:
-        if self.df is None:
+        if self.data is None:
             messagebox.showwarning("No Data", "Load data before sharing analysis.")
             return
         zip_path = filedialog.asksaveasfilename(defaultextension=".zip", filetypes=[("ZIP Files", "*.zip")])
@@ -1560,13 +1779,15 @@ class ToolBuilderApp(tk.Tk):
             )
             tool_sessions.save_session(session_path, session_payload)
 
-            if isinstance(self.last_result, pd.DataFrame):
+            if PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame):
                 self.last_result.to_csv(result_path, index=True)
+            elif isinstance(self.last_result, csv_engine.CSVTable):
+                self.last_result.to_csv(result_path)
             else:
                 result_path.write_text(str(self.last_result or ""), encoding="utf-8")
 
             chart_written = False
-            if self._pillow_available() and isinstance(self.last_result, pd.DataFrame):
+            if self._pillow_available() and PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame):
                 chart_written = self._export_chart_png(str(chart_path))
 
             summary_text = "\n".join(
@@ -1598,40 +1819,52 @@ class ToolBuilderApp(tk.Tk):
         self.status_var.set(f"Shared analysis exported to {zip_path}.")
 
     def _run_analysis(self) -> None:
-        if self.df is None:
+        if self.data is None:
             messagebox.showwarning("No Data", "Load a CSV file before running analysis.")
             return
         selected_columns = self._selected_listbox_values(self.column_listbox)
         group_by = self._selected_listbox_values(self.group_listbox)
         operation = self.operation_var.get()
         try:
-            df = apply_filters(self.df, self._current_filters())
-            result = perform_operation(df, selected_columns, group_by, operation)
+            filtered = apply_filters(self.data, self._current_filters())
+            result = perform_operation(filtered, selected_columns, group_by, operation)
         except ValueError as exc:
             messagebox.showerror("Analysis Error", str(exc))
             self.status_var.set(f"Error: {exc}")
             return
         self.last_result = result
         self.results_text.delete("1.0", tk.END)
-        self.results_text.insert(tk.END, result.to_string())
+        if PANDAS_AVAILABLE and pd is not None and isinstance(result, pd.DataFrame):
+            self.results_text.insert(tk.END, result.to_string())
+            self._update_chart_options(result)
+            self._render_chart()
+        elif isinstance(result, csv_engine.CSVTable):
+            self.results_text.insert(tk.END, result.to_text())
+        else:
+            self.results_text.insert(tk.END, str(result))
         self.status_var.set("Analysis complete.")
-        self._update_chart_options(result)
-        self._render_chart()
 
     def _save_results(self) -> None:
         if self.last_result is None:
             messagebox.showwarning("No Results", "Run an analysis first.")
             return
-        default_ext = ".csv" if isinstance(self.last_result, pd.DataFrame) else ".txt"
+        default_ext = ".csv" if isinstance(self.last_result, (csv_engine.CSVTable,)) else ".txt"
+        if PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame):
+            default_ext = ".csv"
         path = filedialog.asksaveasfilename(
             defaultextension=default_ext,
-            filetypes=[("CSV Files", "*.csv"), ("Text Files", "*.txt")],
+            filetypes=[("CSV Files", "*.csv"), ("TSV Files", "*.tsv"), ("Text Files", "*.txt")],
         )
         if not path:
             return
         try:
-            if isinstance(self.last_result, pd.DataFrame):
+            if PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame):
                 self.last_result.to_csv(path, index=True)
+            elif isinstance(self.last_result, csv_engine.CSVTable):
+                if path.endswith(".tsv"):
+                    self.last_result.to_tsv(path)
+                else:
+                    self.last_result.to_csv(path)
             else:
                 Path(path).write_text(str(self.last_result), encoding="utf-8")
         except OSError as exc:
@@ -1644,7 +1877,12 @@ class ToolBuilderApp(tk.Tk):
         if self.last_result is None:
             messagebox.showwarning("No Results", "Run an analysis first.")
             return
-        text = self.last_result.to_string() if isinstance(self.last_result, pd.DataFrame) else str(self.last_result)
+        if PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame):
+            text = self.last_result.to_string()
+        elif isinstance(self.last_result, csv_engine.CSVTable):
+            text = self.last_result.to_text()
+        else:
+            text = str(self.last_result)
         self.clipboard_clear()
         self.clipboard_append(text)
         self.status_var.set("Results copied to clipboard.")
@@ -1684,27 +1922,47 @@ class ToolBuilderApp(tk.Tk):
         rows = []
         for csv_path in sorted(Path(folder).glob("*.csv")):
             try:
-                df = load_dataframe(csv_path)
-                filtered = apply_filters(df, filter_rules)
+                data_table = load_data([str(csv_path)], "Single file", None)
+                filtered = apply_filters(data_table, filter_rules)
                 result = perform_operation(filtered, selected_columns, group_by, operation)
             except ValueError as exc:
                 messagebox.showerror("Batch Error", f"{csv_path.name}: {exc}")
                 return
-            if result.empty:
-                continue
-            prepared = result.reset_index()
-            prepared.insert(0, "Source File", csv_path.name)
-            rows.append(prepared)
+            if PANDAS_AVAILABLE and pd is not None and isinstance(result, pd.DataFrame):
+                prepared = result.reset_index()
+                prepared.insert(0, "Source File", csv_path.name)
+                rows.append(prepared)
+            elif isinstance(result, csv_engine.CSVTable):
+                for row in result.rows:
+                    row["Source File"] = csv_path.name
+                rows.append(result)
         if not rows:
             messagebox.showwarning("Batch Results", "No results produced for the selected folder.")
             return
-        aggregated = pd.concat(rows, ignore_index=True)
-        self.last_result = aggregated
-        self.results_text.delete("1.0", tk.END)
-        self.results_text.insert(tk.END, aggregated.to_string(index=False))
-        self.status_var.set(f"Batch run complete for {len(rows)} files.")
-        self._update_chart_options(aggregated)
-        self._render_chart()
+        if PANDAS_AVAILABLE and pd is not None:
+            aggregated = pd.concat(rows, ignore_index=True)
+            self.last_result = aggregated
+            self.results_text.delete("1.0", tk.END)
+            self.results_text.insert(tk.END, aggregated.to_string(index=False))
+            self.status_var.set(f"Batch run complete for {len(rows)} files.")
+            self._update_chart_options(aggregated)
+            self._render_chart()
+        else:
+            combined_rows: list[dict[str, str]] = []
+            columns: list[str] = []
+            for table in rows:
+                if isinstance(table, csv_engine.CSVTable):
+                    if "Source File" not in table.columns:
+                        table.columns.append("Source File")
+                    for col in table.columns:
+                        if col not in columns:
+                            columns.append(col)
+                    combined_rows.extend(table.rows)
+            combined = csv_engine.CSVTable(columns=columns, rows=combined_rows)
+            self.last_result = combined
+            self.results_text.delete("1.0", tk.END)
+            self.results_text.insert(tk.END, combined.to_text())
+            self.status_var.set(f"Batch run complete for {len(rows)} files.")
 
     def _save_recipe(self) -> None:
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Files", "*.json")])
@@ -1776,38 +2034,104 @@ class ToolBuilderApp(tk.Tk):
         self._validate_inputs()
         self._render_chart()
 
+    def _drain_status_queue(self) -> None:
+        try:
+            while True:
+                message = self._status_queue.get_nowait()
+                self.status_var.set(message)
+        except queue.Empty:
+            pass
+        self.after(500, self._drain_status_queue)
+
+    def _set_empty_states(self) -> None:
+        self.preview_text.delete("1.0", tk.END)
+        self.preview_text.insert(tk.END, "Load a CSV to begin.")
+        self.results_text.delete("1.0", tk.END)
+        self.results_text.insert(tk.END, "Run an analysis to see results here.")
+        self._set_analyze_state(False)
+        missing = []
+        if not PANDAS_AVAILABLE:
+            missing.append("pandas")
+        if not MATPLOTLIB_AVAILABLE:
+            missing.append("matplotlib")
+        if missing:
+            self.warning_var.set(f"Optional features missing: {', '.join(missing)}.")
+
+    def _set_analyze_state(self, enabled: bool) -> None:
+        for widget in getattr(self, "_analysis_widgets", []):
+            try:
+                if isinstance(widget, ttk.Combobox) and enabled:
+                    widget.configure(state="readonly")
+                else:
+                    widget.configure(state="normal" if enabled else "disabled")
+            except tk.TclError:
+                pass
+
+    def _open_diagnostics(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("Diagnostics")
+        dialog.geometry("520x320")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+
+        info_frame = ttk.Frame(dialog, padding=(12, 12))
+        info_frame.grid(row=0, column=0, sticky="nsew")
+        info_frame.columnconfigure(1, weight=1)
+        ttk.Label(info_frame, text="Optional Dependencies", font=("Segoe UI", 11, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
+        )
+        ttk.Label(info_frame, text=f"pandas: {'Available' if PANDAS_AVAILABLE else 'Missing'}").grid(
+            row=1, column=0, sticky="w"
+        )
+        ttk.Label(info_frame, text=f"matplotlib: {'Available' if MATPLOTLIB_AVAILABLE else 'Missing'}").grid(
+            row=2, column=0, sticky="w"
+        )
+        if not PANDAS_AVAILABLE:
+            ttk.Label(info_frame, text=f"{_PANDAS_MESSAGE}").grid(row=1, column=1, sticky="w")
+        if not MATPLOTLIB_AVAILABLE:
+            ttk.Label(info_frame, text=f"{_MATPLOTLIB_MESSAGE}").grid(row=2, column=1, sticky="w")
+
+        ttk.Label(info_frame, text="Watchers", font=("Segoe UI", 11, "bold")).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(12, 6)
+        )
+        watcher_status = "Safe mode" if self.safe_mode_var.get() else "Active"
+        ttk.Label(info_frame, text=f"Status: {watcher_status}").grid(row=4, column=0, sticky="w")
+        ttk.Label(info_frame, text=f"CSV auto-reload: {self.auto_reload_csv_var.get()}").grid(
+            row=5, column=0, sticky="w"
+        )
+        ttk.Label(info_frame, text=f"Plugin auto-reload: {self.auto_reload_plugins_var.get()}").grid(
+            row=6, column=0, sticky="w"
+        )
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=1, column=0, pady=(0, 12))
+        close_btn = ttk.Button(button_frame, text="Close", command=dialog.destroy)
+        close_btn.grid(row=0, column=0)
+
+    def _open_install_help(self) -> None:
+        messagebox.showinfo(
+            "Install Optional Features",
+            "Install optional features with:\n\n"
+            "python -m pip install -r requirements-optional.txt",
+        )
+
 
 def self_check() -> tuple[bool, str]:
-    if pd is None:
-        return False, "pandas is required for Tool Builder self-check."
-    data = {
-        "Shift": ["A", "A", "B", "B"],
-        "Duration": [5, 10, 3, 12],
-        "Reason": ["Jam", "Jam", "Reset", "Reset"],
-    }
-    df = pd.DataFrame(data)
     try:
-        result = perform_operation(df, ["Duration"], ["Shift"], "SUM")
-        if result.loc["A", "Duration"] != 15:
-            return False, "Self-check failed: unexpected SUM result."
-        filtered = apply_filters(df, [FilterRule("Shift", "=", "B")])
-        if len(filtered) != 2:
-            return False, "Self-check failed: filter count mismatch."
-        with tempfile.TemporaryDirectory() as tmpdir:
-            left_path = Path(tmpdir) / "left.csv"
-            right_path = Path(tmpdir) / "right.csv"
-            df[["Shift", "Duration"]].to_csv(left_path, index=False)
-            df[["Shift", "Reason"]].to_csv(right_path, index=False)
-            merged = merge_dataframes([str(left_path), str(right_path)], "Side-by-side (join)", "Shift")
-            if "left_Duration" not in merged.columns:
-                return False, "Self-check failed: merge result missing expected columns."
+        data = csv_engine.CSVTable(
+            columns=["Shift", "Duration"],
+            rows=[{"Shift": "A", "Duration": "5"}, {"Shift": "B", "Duration": "7"}],
+        )
+        result = csv_engine.group_count(data, ["Shift"], ["Duration"])
+        if not result.rows:
+            return False, "Self-check failed: COUNT result empty."
     except Exception as exc:  # noqa: BLE001 - surface for diagnostics
         return False, f"Self-check failed: {exc}"
     return True, "Self-check passed."
 
 
 def run_analysis(input_path: str) -> str:
-    _require_pandas()
     app = ToolBuilderApp(initial_csv=input_path)
     app.mainloop()
     return "Tool Builder Wizard closed."
@@ -1821,9 +2145,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str]) -> int:
-    if pd is None:
-        print("pandas is required for Tool Builder. Install pandas to continue.")
-        return 1
     parser = _build_parser()
     args = parser.parse_args(argv[1:])
     if args.self_check:

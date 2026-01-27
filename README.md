@@ -98,16 +98,26 @@ No proprietary systems, processes, or confidential information are referenced or
 **Features include:**
 - CSV file load and multi-file merge (vertical/horizontal)
 - Data filtering, group-by, and summary ops
-- Chart preview (bar, line, pie)
+- Chart preview (bar, line, pie) when optional charting support is installed
 - Clipboard copy and CSV export
 - Smart suggest (auto-analysis hints)
 - Batch runner for folder-level analysis
 - Recipe save/load support
-- Theme selection (dark, contrast, large font)
+- Theme + density selection (comfortable/compact/large text)
+
+**Works without optional dependencies (vanilla Python):**
+- Load CSV, preview rows, filter, group + COUNT, export CSV/TSV
+
+**Optional features (install when available):**
+- pandas: advanced operations (sum/average/min/max/outlier/trend) and smart suggestions
+- matplotlib: charts tab
+
+Install optional features:
+`python -m pip install -r requirements-optional.txt`
 
 **Example command:** `python -m tools.tool_builder`
 
-**Self-check:** Load `data/sample_downtime.csv`, group by shift, summarize duration, preview a chart, save/export.
+**Self-check:** Load `data/sample_downtime.csv`, group by shift, run COUNT, save/export results.
 
 ## Packaging as a Standalone Executable
 See [Packaging MOIT as a Standalone Windows Executable](docs/packaging_moit_exe.md) for the PyInstaller command, bundled data notes, and validation checklist.  
