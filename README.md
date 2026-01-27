@@ -51,6 +51,8 @@ No proprietary systems, processes, or confidential information are referenced or
   - `python -m tools.run safety --csv data/sample_safety_observations.csv`
 - Shift Handoff Validator:
   - `python -m tools.run handoff-validate --file docs/sample_handoff.md`
+- Tool Builder Wizard (GUI-based data flow creator):
+  - `python -m tools.tool_builder`
 - Run unit tests:
   - `python -m tools.run test`
 
@@ -68,6 +70,8 @@ No proprietary systems, processes, or confidential information are referenced or
   - `python tools/safety_trend_analyzer.py data/sample_safety_observations.csv`
 - Shift Handoff Validator:
   - `python tools/handoff_validator.py docs/sample_handoff.md`
+- Tool Builder Wizard:
+  - `python tools/tool_builder.py`
 
 ### Run tests (manual)
 
@@ -80,6 +84,7 @@ No proprietary systems, processes, or confidential information are referenced or
 - [Safety Observation Trend Analyzer](docs/tool_safety_trend_analyzer.md)
 - [Shift Handoff Template + Validator](docs/tool_handoff_validator.md)
 - [GUI Wrapper](docs/tool_gui.md)
+- [Tool Builder Wizard](docs/tool_builder.md)
 
 ## GUI Wrapper (Tkinter)
 **Purpose:** Provide a desktop interface for running MOIT CLI tools, exporting reports, and guiding non-technical users through onboarding.  
@@ -87,6 +92,22 @@ No proprietary systems, processes, or confidential information are referenced or
 **Outputs:** Text results in the GUI output panel, exported `.txt`/`.csv` reports via **Save Results…**, status + last run time, and a Logs/Diagnostics view.  
 **Example command:** `python -m tools.gui`  
 **Self-check:** Run the Downtime tool with `data/sample_downtime.csv`, confirm output appears, save a report file, and open the configured output folder from **Help → Open Output Folder**.  
+
+## Tool Builder Wizard (Tkinter)
+**Purpose:** Empower non-coders to perform grouped analysis, summaries, filtering, and export workflows without writing code.  
+**Features include:**
+- CSV file load and multi-file merge (vertical/horizontal)
+- Data filtering, group-by, and summary ops
+- Chart preview (bar, line, pie)
+- Clipboard copy and CSV export
+- Smart suggest (auto-analysis hints)
+- Batch runner for folder-level analysis
+- Recipe save/load support
+- Theme selection (dark, contrast, large font)
+
+**Example command:** `python -m tools.tool_builder`
+
+**Self-check:** Load `data/sample_downtime.csv`, group by shift, summarize duration, preview a chart, save/export.
 
 ## Packaging as a Standalone Executable
 See [Packaging MOIT as a Standalone Windows Executable](docs/packaging_moit_exe.md) for the PyInstaller command, bundled data notes, and validation checklist.  
@@ -113,7 +134,7 @@ Hot hours (downtime minutes by hour):
 - 0: 395 min
 - 1: 218 min
 - 2: 160 min
-````
+```
 
 ### Throughput Sensitivity Model
 
