@@ -115,6 +115,10 @@ def load_session(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def default_session_path() -> Path:
+    return Path.home() / ".moit_tool_session.json"
+
+
 def self_check() -> tuple[bool, str]:
     sample_df = pd.DataFrame({"Region": ["North", "South"], "Value": [10, 20]})
     config = ChartConfig(title="Sample")
