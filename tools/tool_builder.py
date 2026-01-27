@@ -11,9 +11,12 @@ Self-check: python tools/tool_builder.py --self-check
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import io
 import json
 import math
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,8 @@ from typing import Any
 import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
+
+from tools import tool_plugins, tool_sessions
 
 
 OPERATIONS = [
@@ -40,6 +45,7 @@ MERGE_MODES = ["Single file", "Stack (concat)", "Side-by-side (join)"]
 NUMERIC_OPERATIONS = {"SUM", "AVERAGE", "MAX", "MIN", "OUTLIER DETECTION", "TREND"}
 CHART_TYPES = ["Bar", "Line", "Pie"]
 THEME_MODES = ["Default", "Dark", "Large Fonts", "Compact"]
+PLUGIN_FOLDER = Path(__file__).resolve().parent / "plugins"
 
 
 @dataclass(frozen=True)
@@ -313,6 +319,8 @@ class ToolBuilderApp(tk.Tk):
         self.df: pd.DataFrame | None = None
         self.last_result: pd.DataFrame | str | None = None
         self.csv_paths: list[str] = []
+        self.chart_config = tool_sessions.ChartConfig()
+        self.plugins: list[tool_plugins.PluginTool] = []
 
         self.csv_path_var = tk.StringVar(value=initial_csv or "")
         self.operation_var = tk.StringVar(value=OPERATIONS[0])
@@ -326,6 +334,7 @@ class ToolBuilderApp(tk.Tk):
         self.theme_var = tk.StringVar(value=THEME_MODES[0])
         self.status_var = tk.StringVar(value="Load a CSV to begin.")
         self.warning_var = tk.StringVar(value="")
+        self.plugin_var = tk.StringVar(value="")
         self._base_font_size = tkfont.nametofont("TkDefaultFont").actual()["size"]
 
         self._build_layout()
@@ -444,9 +453,28 @@ class ToolBuilderApp(tk.Tk):
         batch_btn.grid(row=0, column=6, sticky="w", padx=4)
         clear_btn = ttk.Button(action_frame, text="Clear Results", command=self._clear_results)
         clear_btn.grid(row=0, column=7, sticky="w", padx=4)
+        save_session_btn = ttk.Button(action_frame, text="Save Session", command=self._save_session)
+        save_session_btn.grid(row=1, column=0, sticky="w", padx=4, pady=(6, 0))
+        load_session_btn = ttk.Button(action_frame, text="Load Session", command=self._load_session)
+        load_session_btn.grid(row=1, column=1, sticky="w", padx=4, pady=(6, 0))
+        ask_ai_btn = ttk.Button(action_frame, text="Ask AI", command=self._explain_data)
+        ask_ai_btn.grid(row=1, column=2, sticky="w", padx=4, pady=(6, 0))
+        share_btn = ttk.Button(action_frame, text="Share Analysis", command=self._share_analysis)
+        share_btn.grid(row=1, column=3, sticky="w", padx=4, pady=(6, 0))
+
+        plugin_frame = ttk.LabelFrame(self, text="Plugin Tools")
+        plugin_frame.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 6))
+        plugin_frame.columnconfigure(1, weight=1)
+        ttk.Label(plugin_frame, text="Plugin:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        self.plugin_combo = ttk.Combobox(plugin_frame, textvariable=self.plugin_var, state="readonly", width=30)
+        self.plugin_combo.grid(row=0, column=1, sticky="w", padx=8, pady=6)
+        plugin_run_btn = ttk.Button(plugin_frame, text="Run Plugin", command=self._run_plugin)
+        plugin_run_btn.grid(row=0, column=2, sticky="w", padx=8, pady=6)
+        plugin_reload_btn = ttk.Button(plugin_frame, text="Reload Plugins", command=self._reload_plugins)
+        plugin_reload_btn.grid(row=0, column=3, sticky="w", padx=8, pady=6)
 
         result_frame = ttk.LabelFrame(self, text="4) Results")
-        result_frame.grid(row=7, column=0, sticky="nsew", padx=16, pady=6)
+        result_frame.grid(row=8, column=0, sticky="nsew", padx=16, pady=6)
         result_frame.columnconfigure(0, weight=1)
         result_frame.rowconfigure(0, weight=1)
         results_notebook = ttk.Notebook(result_frame)
@@ -482,6 +510,10 @@ class ToolBuilderApp(tk.Tk):
             width=18,
         )
         self.chart_column_combo.grid(row=0, column=3, sticky="w")
+        chart_edit_btn = ttk.Button(chart_controls, text="Edit Chart", command=self._open_chart_editor)
+        chart_edit_btn.grid(row=0, column=4, sticky="w", padx=(12, 4))
+        chart_export_btn = ttk.Button(chart_controls, text="Export PNG", command=self._export_chart_dialog)
+        chart_export_btn.grid(row=0, column=5, sticky="w")
         self.chart_canvas = tk.Canvas(chart_frame, height=320, background="white")
         self.chart_canvas.pack(fill="both", expand=True)
 
@@ -489,7 +521,7 @@ class ToolBuilderApp(tk.Tk):
         results_notebook.add(chart_frame, text="Chart Preview")
 
         status_frame = ttk.Frame(self)
-        status_frame.grid(row=8, column=0, sticky="ew", padx=16, pady=(4, 12))
+        status_frame.grid(row=9, column=0, sticky="ew", padx=16, pady=(4, 12))
         status_label = ttk.Label(status_frame, textvariable=self.status_var)
         status_label.pack(anchor="w")
         warning_label = tk.Label(status_frame, textvariable=self.warning_var, fg="#b54700")
@@ -513,11 +545,20 @@ class ToolBuilderApp(tk.Tk):
         Tooltip(recipe_save_btn, "Save current configuration as a recipe JSON.")
         Tooltip(recipe_load_btn, "Load a saved recipe JSON.")
         Tooltip(batch_btn, "Run a recipe across a folder of CSVs.")
+        Tooltip(save_session_btn, "Save the current session to a .moitsession.json file.")
+        Tooltip(load_session_btn, "Load a saved .moitsession.json session file.")
+        Tooltip(ask_ai_btn, "Summarize the current data in natural language.")
+        Tooltip(share_btn, "Export a shareable ZIP with results and session files.")
         Tooltip(theme_combo, "Switch theme and typography modes.")
         Tooltip(chart_type_combo, "Pick a chart type for preview.")
         Tooltip(self.chart_column_combo, "Choose which column to chart.")
+        Tooltip(chart_edit_btn, "Adjust chart labels, colors, and display options.")
+        Tooltip(chart_export_btn, "Export the current chart preview as a PNG image.")
+        Tooltip(self.plugin_combo, "Select a plugin from the plugins folder.")
+        Tooltip(plugin_run_btn, "Run the selected plugin against the loaded data.")
+        Tooltip(plugin_reload_btn, "Reload plugins from the plugins folder.")
 
-        self.rowconfigure(7, weight=1)
+        self.rowconfigure(8, weight=1)
 
         self.column_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
         self.group_listbox.bind("<<ListboxSelect>>", lambda _event: self._validate_inputs())
@@ -532,6 +573,7 @@ class ToolBuilderApp(tk.Tk):
         self.chart_column_var.trace_add("write", lambda *_args: self._render_chart())
         self.theme_var.trace_add("write", lambda *_args: self._apply_theme())
         self._apply_theme()
+        self._reload_plugins()
 
     def _browse_csv(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
@@ -689,6 +731,39 @@ class ToolBuilderApp(tk.Tk):
         else:
             self.chart_column_var.set("")
 
+    def _normalized_chart_color(self) -> str:
+        color = self.chart_config.color.strip() or "#4a90e2"
+        if color.startswith("#") and len(color) == 7:
+            return color
+        return "#4a90e2"
+
+    def _generate_palette(self, base_color: str, count: int) -> list[str]:
+        if not base_color.startswith("#") or len(base_color) != 7:
+            base_color = "#4a90e2"
+        red = int(base_color[1:3], 16)
+        green = int(base_color[3:5], 16)
+        blue = int(base_color[5:7], 16)
+        palette = []
+        for idx in range(count):
+            factor = 0.85 + (idx % 5) * 0.03
+            palette.append(
+                f"#{min(255, int(red * factor)):02x}"
+                f"{min(255, int(green * factor)):02x}"
+                f"{min(255, int(blue * factor)):02x}"
+            )
+        return palette
+
+    def _sorted_chart_data(self, labels: list[str], values: list[float]) -> tuple[list[str], list[float]]:
+        sort_order = self.chart_config.sort_order
+        if sort_order == "Original":
+            return labels, values
+        reverse = sort_order == "Descending"
+        pairs = sorted(zip(labels, values), key=lambda item: item[1], reverse=reverse)
+        if not pairs:
+            return labels, values
+        sorted_labels, sorted_values = zip(*pairs)
+        return list(sorted_labels), list(sorted_values)
+
     def _render_chart(self) -> None:
         self.chart_canvas.delete("all")
         if not isinstance(self.last_result, pd.DataFrame):
@@ -705,6 +780,7 @@ class ToolBuilderApp(tk.Tk):
         chart_type = self.chart_type_var.get()
         labels = [str(label) for label in result.index.tolist()]
         values = pd.to_numeric(result[column], errors="coerce").fillna(0).tolist()
+        labels, values = self._sorted_chart_data(labels, values)
         if len(values) > 20:
             self.chart_canvas.create_text(10, 10, anchor="nw", text="Chart preview limited to 20 points.")
             labels = labels[:20]
@@ -713,6 +789,31 @@ class ToolBuilderApp(tk.Tk):
         width = self.chart_canvas.winfo_width() or 600
         height = self.chart_canvas.winfo_height() or 320
         padding = 40
+        top_padding = 40
+        if self.chart_config.title:
+            top_padding = 55
+            self.chart_canvas.create_text(
+                width / 2,
+                16,
+                text=self.chart_config.title,
+                font=("Segoe UI", 12, "bold"),
+            )
+        if self.chart_config.x_label:
+            self.chart_canvas.create_text(
+                width / 2,
+                height - 10,
+                text=self.chart_config.x_label,
+                font=("Segoe UI", 10),
+            )
+        if self.chart_config.y_label:
+            self.chart_canvas.create_text(
+                14,
+                height / 2,
+                text=self.chart_config.y_label,
+                angle=90,
+                font=("Segoe UI", 10),
+            )
+        base_color = self._normalized_chart_color()
         if chart_type == "Pie":
             total = sum(abs(value) for value in values)
             if total == 0:
@@ -722,9 +823,10 @@ class ToolBuilderApp(tk.Tk):
             radius = min(width, height) // 3
             center_x = width // 2
             center_y = height // 2
+            palette = self._generate_palette(base_color, len(values))
             for idx, value in enumerate(values):
                 extent = 360 * abs(value) / total
-                color = f"#{(idx * 40 + 60) % 255:02x}{(idx * 80 + 90) % 255:02x}{(idx * 120 + 120) % 255:02x}"
+                color = palette[idx]
                 self.chart_canvas.create_arc(
                     center_x - radius,
                     center_y - radius,
@@ -735,6 +837,9 @@ class ToolBuilderApp(tk.Tk):
                     fill=color,
                     outline="",
                 )
+                if self.chart_config.show_data_labels:
+                    label_text = f"{labels[idx]} ({value})"
+                    self.chart_canvas.create_text(center_x, center_y + radius + 18 + idx * 14, text=label_text)
                 start_angle += extent
             self.chart_canvas.create_text(10, height - 20, anchor="sw", text=" | ".join(labels))
             return
@@ -748,22 +853,460 @@ class ToolBuilderApp(tk.Tk):
                 x1 = x0 + bar_width * 0.8
                 scaled = (value - min_value) / value_range
                 y1 = height - padding
-                y0 = y1 - scaled * (height - 2 * padding)
-                self.chart_canvas.create_rectangle(x0, y0, x1, y1, fill="#4a90e2", outline="")
+                y0 = y1 - scaled * (height - padding - top_padding)
+                self.chart_canvas.create_rectangle(x0, y0, x1, y1, fill=base_color, outline="")
+                if self.chart_config.show_data_labels:
+                    self.chart_canvas.create_text((x0 + x1) / 2, y0 - 8, text=f"{value}")
         else:
             points = []
             for idx, value in enumerate(values):
                 x = padding + idx * (width - 2 * padding) / max(1, len(values) - 1)
                 scaled = (value - min_value) / value_range
-                y = height - padding - scaled * (height - 2 * padding)
+                y = height - padding - scaled * (height - padding - top_padding)
                 points.append((x, y))
             for idx in range(1, len(points)):
-                self.chart_canvas.create_line(*points[idx - 1], *points[idx], fill="#4a90e2", width=2)
-            for x, y in points:
-                self.chart_canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#4a90e2", outline="")
+                self.chart_canvas.create_line(*points[idx - 1], *points[idx], fill=base_color, width=2)
+            for idx, (x, y) in enumerate(points):
+                self.chart_canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=base_color, outline="")
+                if self.chart_config.show_data_labels:
+                    self.chart_canvas.create_text(x, y - 10, text=f"{values[idx]}")
         for idx, label in enumerate(labels):
             x = padding + idx * (width - 2 * padding) / max(1, len(labels) - 1)
-            self.chart_canvas.create_text(x, height - padding + 10, text=label, anchor="n")
+            self.chart_canvas.create_text(
+                x,
+                height - padding + 10,
+                text=label,
+                anchor="n",
+                angle=self.chart_config.x_label_rotation,
+            )
+
+    def _open_chart_editor(self) -> None:
+        editor = tk.Toplevel(self)
+        editor.title("Chart Editor")
+        editor.geometry("420x360")
+        editor.transient(self)
+        editor.grab_set()
+
+        title_var = tk.StringVar(value=self.chart_config.title)
+        x_label_var = tk.StringVar(value=self.chart_config.x_label)
+        y_label_var = tk.StringVar(value=self.chart_config.y_label)
+        color_var = tk.StringVar(value=self.chart_config.color)
+        sort_var = tk.StringVar(value=self.chart_config.sort_order)
+        rotation_var = tk.StringVar(value=str(self.chart_config.x_label_rotation))
+        data_labels_var = tk.BooleanVar(value=self.chart_config.show_data_labels)
+
+        ttk.Label(editor, text="Chart Title:").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
+        ttk.Entry(editor, textvariable=title_var).grid(row=0, column=1, sticky="ew", padx=12, pady=(12, 4))
+        ttk.Label(editor, text="X Axis Label:").grid(row=1, column=0, sticky="w", padx=12, pady=4)
+        ttk.Entry(editor, textvariable=x_label_var).grid(row=1, column=1, sticky="ew", padx=12, pady=4)
+        ttk.Label(editor, text="Y Axis Label:").grid(row=2, column=0, sticky="w", padx=12, pady=4)
+        ttk.Entry(editor, textvariable=y_label_var).grid(row=2, column=1, sticky="ew", padx=12, pady=4)
+        ttk.Label(editor, text="Primary Color:").grid(row=3, column=0, sticky="w", padx=12, pady=4)
+        ttk.Entry(editor, textvariable=color_var).grid(row=3, column=1, sticky="ew", padx=12, pady=4)
+        ttk.Label(editor, text="Sort Order:").grid(row=4, column=0, sticky="w", padx=12, pady=4)
+        sort_combo = ttk.Combobox(editor, textvariable=sort_var, values=tool_sessions.CHART_SORT_OPTIONS, state="readonly")
+        sort_combo.grid(row=4, column=1, sticky="ew", padx=12, pady=4)
+        ttk.Label(editor, text="X Label Rotation:").grid(row=5, column=0, sticky="w", padx=12, pady=4)
+        rotation_combo = ttk.Combobox(
+            editor,
+            textvariable=rotation_var,
+            values=[str(val) for val in tool_sessions.CHART_ROTATION_OPTIONS],
+            state="readonly",
+        )
+        rotation_combo.grid(row=5, column=1, sticky="ew", padx=12, pady=4)
+        data_label_check = ttk.Checkbutton(editor, text="Show data labels", variable=data_labels_var)
+        data_label_check.grid(row=6, column=0, columnspan=2, sticky="w", padx=12, pady=6)
+
+        button_frame = ttk.Frame(editor)
+        button_frame.grid(row=7, column=0, columnspan=2, pady=12)
+        apply_btn = ttk.Button(
+            button_frame,
+            text="Apply",
+            command=lambda: self._apply_chart_editor(
+                editor,
+                title_var.get(),
+                x_label_var.get(),
+                y_label_var.get(),
+                color_var.get(),
+                sort_var.get(),
+                rotation_var.get(),
+                data_labels_var.get(),
+            ),
+        )
+        apply_btn.grid(row=0, column=0, padx=6)
+        export_btn = ttk.Button(button_frame, text="Export PNG", command=self._export_chart_dialog)
+        export_btn.grid(row=0, column=1, padx=6)
+        close_btn = ttk.Button(button_frame, text="Close", command=editor.destroy)
+        close_btn.grid(row=0, column=2, padx=6)
+
+        editor.columnconfigure(1, weight=1)
+        Tooltip(apply_btn, "Apply chart settings and refresh the preview.")
+        Tooltip(export_btn, "Export the chart preview as a PNG file.")
+        Tooltip(close_btn, "Close the chart editor.")
+
+    def _apply_chart_editor(
+        self,
+        editor: tk.Toplevel,
+        title: str,
+        x_label: str,
+        y_label: str,
+        color: str,
+        sort_order: str,
+        rotation: str,
+        show_labels: bool,
+    ) -> None:
+        self.chart_config = tool_sessions.ChartConfig(
+            title=title.strip(),
+            x_label=x_label.strip(),
+            y_label=y_label.strip(),
+            color=color.strip() or "#4a90e2",
+            sort_order=sort_order if sort_order in tool_sessions.CHART_SORT_OPTIONS else "Original",
+            x_label_rotation=(
+                int(rotation)
+                if rotation.isdigit() and int(rotation) in tool_sessions.CHART_ROTATION_OPTIONS
+                else tool_sessions.CHART_ROTATION_OPTIONS[0]
+            ),
+            show_data_labels=show_labels,
+        )
+        self._render_chart()
+        editor.focus_set()
+
+    def _pillow_available(self) -> bool:
+        return importlib.util.find_spec("PIL") is not None
+
+    def _export_chart_dialog(self) -> None:
+        if not self._pillow_available():
+            messagebox.showwarning(
+                "Export Unavailable",
+                "PNG export requires Pillow. Install it or use a different system.",
+            )
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG Image", "*.png")])
+        if not path:
+            return
+        if self._export_chart_png(path):
+            self.status_var.set(f"Chart exported to {path}.")
+
+    def _export_chart_png(self, path: str) -> bool:
+        if not self._pillow_available():
+            return False
+        if not isinstance(self.last_result, pd.DataFrame):
+            messagebox.showwarning("No Chart", "Run an analysis to generate chart data.")
+            return False
+        from PIL import Image
+
+        self.chart_canvas.update()
+        ps_data = self.chart_canvas.postscript(colormode="color")
+        try:
+            image = Image.open(io.BytesIO(ps_data.encode("utf-8")))
+            image.save(path, "png")
+        except Exception as exc:  # noqa: BLE001 - surface export errors
+            messagebox.showerror("Export Error", f"Could not export chart: {exc}")
+            return False
+        return True
+
+    def _reload_plugins(self) -> None:
+        PLUGIN_FOLDER.mkdir(parents=True, exist_ok=True)
+        plugins, errors = tool_plugins.load_plugins(PLUGIN_FOLDER)
+        self.plugins = plugins
+        names = [plugin.name for plugin in plugins]
+        if hasattr(self, "plugin_combo"):
+            self.plugin_combo["values"] = names
+        if names:
+            self.plugin_var.set(names[0])
+        else:
+            self.plugin_var.set("")
+        if hasattr(self, "plugin_var"):
+            self.status_var.set("Plugins loaded." if plugins else "No plugins found.")
+        if errors:
+            messagebox.showwarning("Plugin Load Issues", "\n".join(errors))
+
+    def _run_plugin(self) -> None:
+        if self.df is None:
+            messagebox.showwarning("No Data", "Load a CSV file before running plugins.")
+            return
+        plugin_name = self.plugin_var.get()
+        plugin = next((item for item in self.plugins if item.name == plugin_name), None)
+        if plugin is None:
+            messagebox.showwarning("Plugin Missing", "Select a valid plugin tool.")
+            return
+        try:
+            filtered = apply_filters(self.df, self._current_filters())
+        except ValueError as exc:
+            messagebox.showerror("Filter Error", str(exc))
+            return
+        ok, result, error_text = tool_plugins.run_plugin_safe(plugin, filtered)
+        if not ok:
+            messagebox.showerror("Plugin Error", error_text)
+            return
+        self.last_result = result if isinstance(result, pd.DataFrame) else str(result)
+        self.results_text.delete("1.0", tk.END)
+        self.results_text.insert(tk.END, self.last_result.to_string() if isinstance(self.last_result, pd.DataFrame) else self.last_result)
+        if isinstance(self.last_result, pd.DataFrame):
+            self._update_chart_options(self.last_result)
+            self._render_chart()
+        self.status_var.set(f"Plugin '{plugin.name}' completed.")
+
+    def _save_session(self) -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".moitsession.json",
+            filetypes=[("MOIT Session", "*.moitsession.json")],
+        )
+        if not path:
+            return
+        payload = tool_sessions.build_session_payload(
+            csv_paths=self._resolve_csv_paths(),
+            merge_mode=self.merge_mode_var.get(),
+            merge_key=self.merge_key_var.get(),
+            selected_columns=self._selected_listbox_values(self.column_listbox),
+            group_by=self._selected_listbox_values(self.group_listbox),
+            operation=self.operation_var.get(),
+            filter_data={
+                "column": self.filter_column_var.get(),
+                "operator": self.filter_operator_var.get(),
+                "value": self.filter_value_var.get(),
+            },
+            chart_config=self.chart_config,
+            last_result=self.last_result,
+        )
+        try:
+            tool_sessions.save_session(path, payload)
+        except OSError as exc:
+            messagebox.showerror("Session Error", f"Could not save session: {exc}")
+            return
+        self.status_var.set(f"Session saved to {path}.")
+
+    def _load_session(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("MOIT Session", "*.moitsession.json")])
+        if not path:
+            return
+        try:
+            data = tool_sessions.load_session(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Session Error", f"Could not load session: {exc}")
+            return
+        csv_paths = data.get("csv_paths") or []
+        if csv_paths:
+            self.merge_mode_var.set(data.get("merge_mode", MERGE_MODES[0]))
+            self.merge_key_var.set(data.get("merge_key", ""))
+            self._load_csv(csv_paths)
+        self.operation_var.set(data.get("operation", OPERATIONS[0]))
+        self._set_listbox_selection(self.column_listbox, data.get("selected_columns", []))
+        self._set_listbox_selection(self.group_listbox, data.get("group_by", []))
+        filter_data = data.get("filter", {})
+        self.filter_column_var.set(filter_data.get("column", ""))
+        self.filter_operator_var.set(filter_data.get("operator", FILTER_OPERATORS[0]))
+        self.filter_value_var.set(filter_data.get("value", ""))
+        self.chart_config = tool_sessions.ChartConfig.from_dict(data.get("chart_config", {}))
+        self.last_result = tool_sessions.deserialize_last_result(data.get("last_result", {}))
+        self.results_text.delete("1.0", tk.END)
+        if isinstance(self.last_result, pd.DataFrame):
+            self.results_text.insert(tk.END, self.last_result.to_string())
+            self._update_chart_options(self.last_result)
+            self._render_chart()
+        elif self.last_result is not None:
+            self.results_text.insert(tk.END, str(self.last_result))
+            self._render_chart()
+        self.status_var.set(f"Session loaded from {path}.")
+        self._validate_inputs()
+
+    def _explain_data(self) -> None:
+        if self.df is None:
+            messagebox.showwarning("No Data", "Load a CSV file before asking for a summary.")
+            return
+        summary_text = self._build_data_summary()
+        self._show_text_report("Explain This Data", summary_text)
+
+    def _build_data_summary(self) -> str:
+        df = self.df
+        if df is None:
+            return "No data available."
+        profiling_available = importlib.util.find_spec("ydata_profiling") is not None
+        if profiling_available:
+            from ydata_profiling import ProfileReport
+
+            profile = ProfileReport(df, minimal=True, progress_bar=False)
+            description = profile.get_description()
+            overview = description.get("overview", {})
+            text_lines = [
+                "Automated Data Summary (ydata-profiling)",
+                f"Rows: {overview.get('n', len(df))}",
+                f"Columns: {overview.get('n_var', len(df.columns))}",
+                "",
+            ]
+            for column, details in description.get("variables", {}).items():
+                common = details.get("top")
+                missing = details.get("n_missing")
+                text_lines.append(f"{column}: top={common}, missing={missing}")
+            return "\n".join(text_lines)
+        profiling_available = importlib.util.find_spec("pandas_profiling") is not None
+        if profiling_available:
+            from pandas_profiling import ProfileReport
+
+            profile = ProfileReport(df, minimal=True, progress_bar=False)
+            description = profile.get_description()
+            overview = description.get("overview", {})
+            text_lines = [
+                "Automated Data Summary (pandas-profiling)",
+                f"Rows: {overview.get('n', len(df))}",
+                f"Columns: {overview.get('n_var', len(df.columns))}",
+                "",
+            ]
+            for column, details in description.get("variables", {}).items():
+                common = details.get("top")
+                missing = details.get("n_missing")
+                text_lines.append(f"{column}: top={common}, missing={missing}")
+            return "\n".join(text_lines)
+        describe = df.describe(include="all").transpose()
+        missing_counts = df.isna().sum()
+        common_values = []
+        for column in df.select_dtypes(exclude="number").columns:
+            top_values = df[column].astype(str).value_counts().head(3).to_dict()
+            common_values.append(f"{column}: {top_values}")
+        outlier_lines = []
+        for column in df.select_dtypes(include="number").columns:
+            series = pd.to_numeric(df[column], errors="coerce").dropna()
+            if series.empty:
+                continue
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            outliers = series[(series < lower) | (series > upper)].count()
+            outlier_lines.append(f"{column}: {outliers} outliers (bounds {lower:.2f} to {upper:.2f})")
+        text_lines = [
+            "Basic Data Summary",
+            f"Rows: {len(df)}",
+            f"Columns: {len(df.columns)}",
+            "",
+            "Missing values by column:",
+            missing_counts.to_string(),
+            "",
+            "Common values (top 3):",
+            "\n".join(common_values) if common_values else "No categorical columns found.",
+            "",
+            "Outlier scan:",
+            "\n".join(outlier_lines) if outlier_lines else "No numeric columns found.",
+            "",
+            "Summary statistics:",
+            describe.to_string(),
+        ]
+        return "\n".join(text_lines)
+
+    def _show_text_report(self, title: str, text: str) -> None:
+        report = tk.Toplevel(self)
+        report.title(title)
+        report.geometry("700x500")
+        report.transient(self)
+        report.grab_set()
+        text_frame = ttk.Frame(report)
+        text_frame.pack(fill="both", expand=True, padx=12, pady=12)
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+        report_text = tk.Text(text_frame, wrap="word")
+        scroll = ttk.Scrollbar(text_frame, command=report_text.yview)
+        report_text.configure(yscrollcommand=scroll.set)
+        report_text.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        report_text.insert(tk.END, text)
+        report_text.configure(state="disabled")
+
+        def save_report() -> None:
+            path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt")])
+            if not path:
+                return
+            Path(path).write_text(text, encoding="utf-8")
+            self.status_var.set(f"Summary saved to {path}.")
+
+        button_frame = ttk.Frame(report)
+        button_frame.pack(pady=(0, 12))
+        save_btn = ttk.Button(button_frame, text="Save Summary", command=save_report)
+        save_btn.grid(row=0, column=0, padx=6)
+        close_btn = ttk.Button(button_frame, text="Close", command=report.destroy)
+        close_btn.grid(row=0, column=1, padx=6)
+        Tooltip(save_btn, "Save the summary text to a file.")
+        Tooltip(close_btn, "Close the summary window.")
+
+    def _share_analysis(self) -> None:
+        if self.df is None:
+            messagebox.showwarning("No Data", "Load data before sharing analysis.")
+            return
+        zip_path = filedialog.asksaveasfilename(defaultextension=".zip", filetypes=[("ZIP Files", "*.zip")])
+        if not zip_path:
+            return
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            recipe_path = temp_dir / "recipe.json"
+            session_path = temp_dir / "session.moitsession.json"
+            result_path = temp_dir / "results.csv"
+            chart_path = temp_dir / "chart.png"
+            summary_path = temp_dir / "summary.txt"
+
+            recipe = {
+                "csv_paths": self._resolve_csv_paths(),
+                "merge_mode": self.merge_mode_var.get(),
+                "merge_key": self.merge_key_var.get(),
+                "selected_columns": self._selected_listbox_values(self.column_listbox),
+                "group_by": self._selected_listbox_values(self.group_listbox),
+                "operation": self.operation_var.get(),
+                "filter": {
+                    "column": self.filter_column_var.get(),
+                    "operator": self.filter_operator_var.get(),
+                    "value": self.filter_value_var.get(),
+                },
+            }
+            recipe_path.write_text(json.dumps(recipe, indent=2), encoding="utf-8")
+
+            session_payload = tool_sessions.build_session_payload(
+                csv_paths=self._resolve_csv_paths(),
+                merge_mode=self.merge_mode_var.get(),
+                merge_key=self.merge_key_var.get(),
+                selected_columns=self._selected_listbox_values(self.column_listbox),
+                group_by=self._selected_listbox_values(self.group_listbox),
+                operation=self.operation_var.get(),
+                filter_data=recipe["filter"],
+                chart_config=self.chart_config,
+                last_result=self.last_result,
+            )
+            tool_sessions.save_session(session_path, session_payload)
+
+            if isinstance(self.last_result, pd.DataFrame):
+                self.last_result.to_csv(result_path, index=True)
+            else:
+                result_path.write_text(str(self.last_result or ""), encoding="utf-8")
+
+            chart_written = False
+            if self._pillow_available() and isinstance(self.last_result, pd.DataFrame):
+                chart_written = self._export_chart_png(str(chart_path))
+
+            summary_text = "\n".join(
+                [
+                    "MOIT Tool Builder Share Summary",
+                    f"CSV files: {', '.join(self._resolve_csv_paths())}",
+                    f"Operation: {self.operation_var.get()}",
+                    f"Group By: {', '.join(self._selected_listbox_values(self.group_listbox)) or 'None'}",
+                    f"Chart Type: {self.chart_type_var.get()}",
+                    f"Chart Exported: {'Yes' if chart_written else 'No'}",
+                ]
+            )
+            summary_path.write_text(summary_text, encoding="utf-8")
+
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                zip_file.write(recipe_path, arcname=recipe_path.name)
+                zip_file.write(session_path, arcname=session_path.name)
+                zip_file.write(summary_path, arcname=summary_path.name)
+                zip_file.write(result_path, arcname=result_path.name)
+                if chart_written:
+                    zip_file.write(chart_path, arcname=chart_path.name)
+        finally:
+            for item in temp_dir.glob("*"):
+                item.unlink(missing_ok=True)
+            temp_dir.rmdir()
+        self.clipboard_clear()
+        self.clipboard_append(zip_path)
+        messagebox.showinfo("Share Analysis", f"ZIP exported to:\n{zip_path}\n(Path copied to clipboard.)")
+        self.status_var.set(f"Shared analysis exported to {zip_path}.")
 
     def _run_analysis(self) -> None:
         if self.df is None:
