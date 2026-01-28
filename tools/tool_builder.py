@@ -67,6 +67,18 @@ class FilterRule:
     value: str
 
 
+@dataclass(frozen=True)
+class ThemePalette:
+    bg: str
+    fg: str
+    field_bg: str
+    field_fg: str
+    border: str
+    select_bg: str
+    select_fg: str
+    insert_bg: str
+
+
 class Tooltip:
     def __init__(self, widget: tk.Widget, text: str) -> None:
         self.widget = widget
@@ -111,6 +123,32 @@ def _requires_pandas(operation: str) -> bool:
         "OUTLIER DETECTION",
         "TREND",
     }
+
+
+def compute_palette(theme_name: str) -> ThemePalette:
+    lowered = theme_name.lower()
+    is_dark = any(token in lowered for token in ("dark", "equilux", "black", "night"))
+    if is_dark:
+        return ThemePalette(
+            bg="#1f1f1f",
+            fg="#f2f2f2",
+            field_bg="#2b2b2b",
+            field_fg="#f2f2f2",
+            border="#3f3f3f",
+            select_bg="#4a90e2",
+            select_fg="#ffffff",
+            insert_bg="#f2f2f2",
+        )
+    return ThemePalette(
+        bg="#f3f3f3",
+        fg="#1a1a1a",
+        field_bg="#ffffff",
+        field_fg="#1a1a1a",
+        border="#c9c9c9",
+        select_bg="#4a90e2",
+        select_fg="#ffffff",
+        insert_bg="#1a1a1a",
+    )
 
 
 def load_data(paths: list[str], mode: str, join_key: str | None) -> Any:
@@ -292,7 +330,7 @@ def perform_pandas_operation(
 ) -> Any:
     if not PANDAS_AVAILABLE or pd is None:
         raise RuntimeError("pandas is required for this operation.")
-    if not selected_columns:
+    if not selected_columns and operation != "COUNT":
         raise ValueError("Select at least one column for analysis.")
     missing_cols = [col for col in selected_columns if col not in df.columns]
     if missing_cols:
@@ -305,6 +343,10 @@ def perform_pandas_operation(
     grouped = df.groupby(group_by) if group_by else None
 
     if operation == "COUNT":
+        if not selected_columns:
+            if grouped is None:
+                return pd.DataFrame({"count": [len(df)]})
+            return grouped.size().to_frame("count")
         return grouped[selected_columns].count() if grouped else df[selected_columns].count().to_frame().T
     if operation == "SUM":
         numeric_df = _coerce_numeric(df, selected_columns)
@@ -422,6 +464,8 @@ class ToolBuilderApp(tk.Tk):
         self._last_update_check = "Never"
         self._density_padding = 8
         self._frames_with_padding: list[ttk.Labelframe] = []
+        self._themed_tk_widgets: list[tk.Widget] = []
+        self._palette = compute_palette(self.theme_var.get())
 
         self._build_layout()
         self._initialize_watchers(self._csv_poll_interval)
@@ -506,10 +550,12 @@ class ToolBuilderApp(tk.Tk):
         status_frame = ttk.Frame(self, padding=(12, 6))
         status_frame.grid(row=2, column=0, sticky="ew")
         status_frame.columnconfigure(0, weight=1)
-        status_label = ttk.Label(status_frame, textvariable=self.status_var)
+        status_label = ttk.Label(status_frame, textvariable=self.status_var, style="Status.TLabel")
         status_label.grid(row=0, column=0, sticky="w")
-        warning_label = ttk.Label(status_frame, textvariable=self.warning_var, foreground="#b54700")
+        warning_label = ttk.Label(status_frame, textvariable=self.warning_var, style="Warning.TLabel")
         warning_label.grid(row=1, column=0, sticky="w")
+        self.status_label = status_label
+        self.warning_label = warning_label
         details_btn = ttk.Button(status_frame, text="Details…", command=self._open_diagnostics)
         details_btn.grid(row=0, column=1, rowspan=2, sticky="e")
 
@@ -573,6 +619,7 @@ class ToolBuilderApp(tk.Tk):
         preview_frame.rowconfigure(0, weight=1)
         preview_frame.columnconfigure(0, weight=1)
         self.preview_text = tk.Text(preview_frame, height=10, wrap="none")
+        self._register_tk_widget(self.preview_text)
         preview_scroll = ttk.Scrollbar(preview_frame, command=self.preview_text.yview)
         self.preview_text.configure(yscrollcommand=preview_scroll.set)
         self.preview_text.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
@@ -608,9 +655,11 @@ class ToolBuilderApp(tk.Tk):
 
         ttk.Label(columns_frame, text="Analyze Columns:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.column_listbox = tk.Listbox(columns_frame, selectmode=tk.MULTIPLE, height=8)
+        self._register_tk_widget(self.column_listbox)
         self.column_listbox.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         ttk.Label(columns_frame, text="Group By:").grid(row=0, column=1, sticky="w", padx=4, pady=4)
         self.group_listbox = tk.Listbox(columns_frame, selectmode=tk.MULTIPLE, height=8)
+        self._register_tk_widget(self.group_listbox)
         self.group_listbox.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
 
         operation_frame = self._add_labelframe(self.analyze_tab, "Operation", 2)
@@ -702,6 +751,7 @@ class ToolBuilderApp(tk.Tk):
         results_frame.rowconfigure(0, weight=1)
 
         self.results_text = tk.Text(results_frame, wrap="none", height=16)
+        self._register_tk_widget(self.results_text)
         results_scroll = ttk.Scrollbar(results_frame, command=self.results_text.yview)
         self.results_text.configure(yscrollcommand=results_scroll.set)
         self.results_text.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
@@ -719,33 +769,17 @@ class ToolBuilderApp(tk.Tk):
 
     def _build_charts_tab(self) -> None:
         self.charts_tab.rowconfigure(1, weight=1)
-        if not MATPLOTLIB_AVAILABLE:
-            banner_frame = ttk.Frame(self.charts_tab)
-            banner_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
-            banner_frame.columnconfigure(0, weight=1)
-            banner = ttk.Label(
-                banner_frame,
-                text="Charts are disabled because matplotlib is not installed.",
-                foreground="#b54700",
-                padding=(12, 6),
-            )
-            banner.grid(row=0, column=0, sticky="w")
-            install_btn = ttk.Button(banner_frame, text="Install optional features", command=self._open_install_help)
-            install_btn.grid(row=0, column=1, sticky="e", padx=(12, 0))
-            self.notebook.tab(self.charts_tab, state="disabled")
-            return
-
         chart_controls = self._add_labelframe(self.charts_tab, "Chart Controls", 0)
         chart_controls.columnconfigure(1, weight=1)
         ttk.Label(chart_controls, text="Chart Type:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-        chart_type_combo = ttk.Combobox(
+        self.chart_type_combo = ttk.Combobox(
             chart_controls,
             textvariable=self.chart_type_var,
             values=CHART_TYPES,
             state="readonly",
             width=10,
         )
-        chart_type_combo.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        self.chart_type_combo.grid(row=0, column=1, sticky="w", padx=4, pady=4)
         ttk.Label(chart_controls, text="Value Column:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
         self.chart_column_combo = ttk.Combobox(
             chart_controls,
@@ -759,13 +793,37 @@ class ToolBuilderApp(tk.Tk):
         chart_export_btn = ttk.Button(chart_controls, text="Export PNG", command=self._export_chart_dialog)
         chart_export_btn.grid(row=0, column=5, sticky="w", padx=4, pady=4)
 
+        self._chart_widgets = [
+            self.chart_type_combo,
+            self.chart_column_combo,
+            chart_edit_btn,
+            chart_export_btn,
+        ]
+
+        if not MATPLOTLIB_AVAILABLE:
+            banner_frame = ttk.Frame(self.charts_tab)
+            banner_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+            banner_frame.columnconfigure(0, weight=1)
+            banner = ttk.Label(
+                banner_frame,
+                text="Charts are disabled because matplotlib is not installed.",
+                foreground="#b54700",
+                padding=(12, 6),
+            )
+            banner.grid(row=0, column=0, sticky="w")
+            install_btn = ttk.Button(banner_frame, text="Install optional features", command=self._open_install_help)
+            install_btn.grid(row=0, column=1, sticky="e", padx=(12, 0))
+            for widget in self._chart_widgets:
+                widget.configure(state="disabled")
+
         chart_frame = self._add_labelframe(self.charts_tab, "Preview", 1)
         chart_frame.columnconfigure(0, weight=1)
         chart_frame.rowconfigure(0, weight=1)
         self.chart_canvas = tk.Canvas(chart_frame, height=320, background="white")
+        self._register_tk_widget(self.chart_canvas)
         self.chart_canvas.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
-        Tooltip(chart_type_combo, "Pick a chart type for preview.")
+        Tooltip(self.chart_type_combo, "Pick a chart type for preview.")
         Tooltip(self.chart_column_combo, "Choose which column to chart.")
         Tooltip(chart_edit_btn, "Adjust chart labels, colors, and display options.")
         Tooltip(chart_export_btn, "Export the current chart preview as a PNG image.")
@@ -897,6 +955,7 @@ class ToolBuilderApp(tk.Tk):
         self.preview_text.delete("1.0", tk.END)
         self.preview_text.insert(tk.END, preview_data(self.data))
         self._populate_columns()
+        self._reset_results_for_new_data()
         self._set_analyze_state(True)
         total_rows = len(self.data) if PANDAS_AVAILABLE and pd is not None and isinstance(self.data, pd.DataFrame) else len(self.data.rows)
         total_columns = len(self.data.columns) if isinstance(self.data, csv_engine.CSVTable) else len(self.data.columns)
@@ -962,12 +1021,13 @@ class ToolBuilderApp(tk.Tk):
                     warnings.append(f"Join key '{join_key}' not found in loaded data.")
         if self.data is not None:
             selected_columns = self._selected_listbox_values(self.column_listbox)
-            if not selected_columns:
-                warnings.append("Select at least one column to analyze.")
             if PANDAS_AVAILABLE and pd is not None and self.operation_var.get() in NUMERIC_OPERATIONS and selected_columns:
                 non_numeric = _columns_missing_numeric_values(self.data, selected_columns)
                 if non_numeric:
                     warnings.append(f"Non-numeric columns selected: {', '.join(non_numeric)}.")
+            group_warning = self._group_by_cardinality_warning()
+            if group_warning:
+                warnings.append(group_warning)
         filter_value = self.filter_value_var.get().strip()
         if self.filter_operator_var.get() in {">", ">=", "<", "<="} and filter_value:
             try:
@@ -977,12 +1037,75 @@ class ToolBuilderApp(tk.Tk):
         if not PANDAS_AVAILABLE and _requires_pandas(self.operation_var.get()):
             warnings.append("This operation requires pandas (optional dependency).")
         self.warning_var.set("Warnings: " + " ".join(warnings) if warnings else "")
+        self._update_run_button_state()
+
+    def _group_by_cardinality_warning(self) -> str | None:
+        if self.data is None:
+            return None
+        group_by = self._selected_listbox_values(self.group_listbox)
+        if not group_by:
+            return None
+        column = group_by[0]
+        try:
+            if isinstance(self.data, csv_engine.CSVTable):
+                values = {row.get(column, "") for row in self.data.rows}
+                ratio = len(values) / max(1, len(self.data.rows))
+            else:
+                unique_count = self.data[column].nunique(dropna=True)
+                ratio = unique_count / max(1, len(self.data))
+        except Exception:
+            return None
+        if ratio >= 0.85:
+            return "Group by has high cardinality; results may be nearly one row per record."
+        return None
+
+    def _update_run_button_state(self) -> None:
+        if not hasattr(self, "run_btn"):
+            return
+        if self.data is None:
+            self.run_btn.configure(state="disabled")
+            return
+        if not PANDAS_AVAILABLE and _requires_pandas(self.operation_var.get()):
+            self.run_btn.configure(state="disabled")
+            return
+        self.run_btn.configure(state="normal")
+
+    def _register_tk_widget(self, widget: tk.Widget) -> None:
+        if widget not in self._themed_tk_widgets:
+            self._themed_tk_widgets.append(widget)
+        self._apply_palette_to_widget(widget, self._palette)
+
+    def _apply_palette_to_widget(self, widget: tk.Widget, palette: ThemePalette) -> None:
+        if isinstance(widget, tk.Listbox):
+            widget.configure(
+                background=palette.field_bg,
+                foreground=palette.field_fg,
+                selectbackground=palette.select_bg,
+                selectforeground=palette.select_fg,
+            )
+        elif isinstance(widget, tk.Text):
+            widget.configure(
+                background=palette.field_bg,
+                foreground=palette.field_fg,
+                insertbackground=palette.insert_bg,
+                selectbackground=palette.select_bg,
+                selectforeground=palette.select_fg,
+            )
+        elif isinstance(widget, tk.Canvas):
+            widget.configure(background=palette.field_bg)
+        elif isinstance(widget, tk.Label):
+            widget.configure(background=palette.bg, foreground=palette.fg)
 
     def _apply_theme(self) -> None:
         style = ttk.Style(self)
         theme = self.theme_var.get()
         if theme in style.theme_names():
             style.theme_use(theme)
+        self._palette = compute_palette(theme)
+        style.configure("Status.TLabel", foreground=self._palette.fg)
+        style.configure("Warning.TLabel", foreground="#b54700")
+        for widget in self._themed_tk_widgets:
+            self._apply_palette_to_widget(widget, self._palette)
 
     def _apply_density(self) -> None:
         density = self.density_var.get()
@@ -1029,17 +1152,53 @@ class ToolBuilderApp(tk.Tk):
     def _update_chart_options(self, result: Any | None) -> None:
         if not MATPLOTLIB_AVAILABLE:
             return
-        if not PANDAS_AVAILABLE or pd is None or result is None:
+        if result is None:
             self.chart_column_combo["values"] = []
             self.chart_column_var.set("")
+            self._update_chart_controls(False)
             return
-        numeric_columns = result.select_dtypes(include="number").columns.tolist()
+        numeric_columns: list[str] = []
+        if PANDAS_AVAILABLE and pd is not None and isinstance(result, pd.DataFrame):
+            numeric_columns = result.select_dtypes(include="number").columns.tolist()
+        elif isinstance(result, csv_engine.CSVTable):
+            numeric_columns = self._numeric_columns_from_csvtable(result)
         self.chart_column_combo["values"] = numeric_columns
         if numeric_columns:
             if self.chart_column_var.get() not in numeric_columns:
                 self.chart_column_var.set(numeric_columns[0])
+            self._update_chart_controls(True)
         else:
             self.chart_column_var.set("")
+            self._update_chart_controls(False)
+
+    def _numeric_columns_from_csvtable(self, table: csv_engine.CSVTable) -> list[str]:
+        numeric_columns: list[str] = []
+        for column in table.columns:
+            for row in table.rows:
+                value = row.get(column, "")
+                if value == "":
+                    continue
+                try:
+                    float(value)
+                except ValueError:
+                    break
+                else:
+                    numeric_columns.append(column)
+                    break
+        return numeric_columns
+
+    def _update_chart_controls(self, enabled: bool) -> None:
+        if not hasattr(self, "_chart_widgets"):
+            return
+        if not MATPLOTLIB_AVAILABLE:
+            enabled = False
+        state = "normal" if enabled else "disabled"
+        for widget in self._chart_widgets:
+            widget.configure(state=state)
+        if enabled and isinstance(self.chart_type_combo, ttk.Combobox):
+            self.chart_type_combo.configure(state="readonly")
+        if enabled and isinstance(self.chart_column_combo, ttk.Combobox):
+            self.chart_column_combo.configure(state="readonly")
 
     def _normalized_chart_color(self) -> str:
         color = self.chart_config.color.strip() or "#4a90e2"
@@ -1074,24 +1233,89 @@ class ToolBuilderApp(tk.Tk):
         sorted_labels, sorted_values = zip(*pairs)
         return list(sorted_labels), list(sorted_values)
 
+    def _safe_float(self, value: str) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _label_column_for_csvtable(self, table: csv_engine.CSVTable, value_column: str) -> str:
+        for column in table.columns:
+            if column == value_column:
+                continue
+            if any(not self._is_number(row.get(column, "")) for row in table.rows):
+                return column
+        if table.columns and table.columns[0] != value_column:
+            return table.columns[0]
+        return ""
+
+    @staticmethod
+    def _is_number(value: str) -> bool:
+        if value == "":
+            return False
+        try:
+            float(value)
+        except (TypeError, ValueError):
+            return False
+        return True
+
     def _render_chart(self) -> None:
-        if not MATPLOTLIB_AVAILABLE:
+        if not hasattr(self, "chart_canvas"):
             return
         self.chart_canvas.delete("all")
-        if not (PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame)):
+        if not MATPLOTLIB_AVAILABLE:
+            self.chart_canvas.create_text(
+                10,
+                10,
+                anchor="nw",
+                text="Charts disabled: matplotlib not installed.\nInstall with: python -m pip install -r requirements-optional.txt",
+            )
+            return
+        if self.last_result is None:
+            self.chart_canvas.create_text(10, 10, anchor="nw", text="Run an analysis to generate chartable results.")
+            return
+        labels: list[str]
+        values: list[float]
+        if PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame):
+            result = self.last_result
+            if result.empty:
+                self.chart_canvas.create_text(10, 10, anchor="nw", text="No data to chart.")
+                return
+            column = self.chart_column_var.get()
+            if not column:
+                self.chart_canvas.create_text(
+                    10,
+                    10,
+                    anchor="nw",
+                    text="No numeric columns available. Run COUNT or choose a numeric result.",
+                )
+                return
+            labels = [str(label) for label in result.index.tolist()]
+            values = pd.to_numeric(result[column], errors="coerce").fillna(0).tolist()
+        elif isinstance(self.last_result, csv_engine.CSVTable):
+            table = self.last_result
+            if not table.rows:
+                self.chart_canvas.create_text(10, 10, anchor="nw", text="No data to chart.")
+                return
+            column = self.chart_column_var.get()
+            if not column:
+                self.chart_canvas.create_text(
+                    10,
+                    10,
+                    anchor="nw",
+                    text="No numeric columns available. Run COUNT or choose a numeric result.",
+                )
+                return
+            label_column = self._label_column_for_csvtable(table, column)
+            labels = [
+                (row.get(label_column, "") if label_column else str(idx + 1))
+                for idx, row in enumerate(table.rows)
+            ]
+            values = [self._safe_float(row.get(column, "")) for row in table.rows]
+        else:
             self.chart_canvas.create_text(10, 10, anchor="nw", text="No chartable data available.")
             return
-        result = self.last_result
-        if result.empty:
-            self.chart_canvas.create_text(10, 10, anchor="nw", text="No data to chart.")
-            return
-        column = self.chart_column_var.get()
-        if not column:
-            self.chart_canvas.create_text(10, 10, anchor="nw", text="Select a numeric column to chart.")
-            return
         chart_type = self.chart_type_var.get()
-        labels = [str(label) for label in result.index.tolist()]
-        values = pd.to_numeric(result[column], errors="coerce").fillna(0).tolist()
         labels, values = self._sorted_chart_data(labels, values)
         if len(values) > 20:
             self.chart_canvas.create_text(10, 10, anchor="nw", text="Chart preview limited to 20 points.")
@@ -1305,7 +1529,7 @@ class ToolBuilderApp(tk.Tk):
     def _export_chart_png(self, path: str) -> bool:
         if not self._pillow_available():
             return False
-        if not (PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame)):
+        if self.last_result is None:
             messagebox.showwarning("No Chart", "Run an analysis to generate chart data.")
             return False
         from PIL import Image
@@ -1563,6 +1787,8 @@ class ToolBuilderApp(tk.Tk):
             self._render_chart()
         elif isinstance(self.last_result, csv_engine.CSVTable):
             self.results_text.insert(tk.END, self.last_result.to_text())
+            self._update_chart_options(self.last_result)
+            self._render_chart()
         elif self.last_result is not None:
             self.results_text.insert(tk.END, str(self.last_result))
         self.status_var.set(source)
@@ -1626,6 +1852,10 @@ class ToolBuilderApp(tk.Tk):
         self.results_text.delete("1.0", tk.END)
         if PANDAS_AVAILABLE and pd is not None and isinstance(self.last_result, pd.DataFrame):
             self.results_text.insert(tk.END, self.last_result.to_string())
+            self._update_chart_options(self.last_result)
+            self._render_chart()
+        elif isinstance(self.last_result, csv_engine.CSVTable):
+            self.results_text.insert(tk.END, self.last_result.to_text())
             self._update_chart_options(self.last_result)
             self._render_chart()
         else:
@@ -1713,6 +1943,7 @@ class ToolBuilderApp(tk.Tk):
         report.rowconfigure(0, weight=1)
         report.columnconfigure(0, weight=1)
         report_text = tk.Text(text_frame, wrap="word")
+        self._register_tk_widget(report_text)
         scroll = ttk.Scrollbar(text_frame, command=report_text.yview)
         report_text.configure(yscrollcommand=scroll.set)
         report_text.grid(row=0, column=0, sticky="nsew")
@@ -1825,6 +2056,12 @@ class ToolBuilderApp(tk.Tk):
         selected_columns = self._selected_listbox_values(self.column_listbox)
         group_by = self._selected_listbox_values(self.group_listbox)
         operation = self.operation_var.get()
+        if not PANDAS_AVAILABLE and _requires_pandas(operation):
+            messagebox.showwarning(
+                "Analysis Disabled",
+                "This operation requires pandas. Install optional dependencies or switch to COUNT.",
+            )
+            return
         try:
             filtered = apply_filters(self.data, self._current_filters())
             result = perform_operation(filtered, selected_columns, group_by, operation)
@@ -1840,6 +2077,8 @@ class ToolBuilderApp(tk.Tk):
             self._render_chart()
         elif isinstance(result, csv_engine.CSVTable):
             self.results_text.insert(tk.END, result.to_text())
+            self._update_chart_options(result)
+            self._render_chart()
         else:
             self.results_text.insert(tk.END, str(result))
         self.status_var.set("Analysis complete.")
@@ -1963,6 +2202,8 @@ class ToolBuilderApp(tk.Tk):
             self.results_text.delete("1.0", tk.END)
             self.results_text.insert(tk.END, combined.to_text())
             self.status_var.set(f"Batch run complete for {len(rows)} files.")
+            self._update_chart_options(combined)
+            self._render_chart()
 
     def _save_recipe(self) -> None:
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Files", "*.json")])
@@ -2034,6 +2275,14 @@ class ToolBuilderApp(tk.Tk):
         self._validate_inputs()
         self._render_chart()
 
+    def _reset_results_for_new_data(self) -> None:
+        self.last_result = None
+        self.results_text.delete("1.0", tk.END)
+        self.results_text.insert(tk.END, "Run an analysis to see results here.")
+        self.chart_column_var.set("")
+        self._update_chart_options(None)
+        self._render_chart()
+
     def _drain_status_queue(self) -> None:
         try:
             while True:
@@ -2056,6 +2305,7 @@ class ToolBuilderApp(tk.Tk):
             missing.append("matplotlib")
         if missing:
             self.warning_var.set(f"Optional features missing: {', '.join(missing)}.")
+        self._render_chart()
 
     def _set_analyze_state(self, enabled: bool) -> None:
         for widget in getattr(self, "_analysis_widgets", []):
@@ -2066,6 +2316,7 @@ class ToolBuilderApp(tk.Tk):
                     widget.configure(state="normal" if enabled else "disabled")
             except tk.TclError:
                 pass
+        self._update_run_button_state()
 
     def _open_diagnostics(self) -> None:
         dialog = tk.Toplevel(self)
@@ -2092,16 +2343,27 @@ class ToolBuilderApp(tk.Tk):
         if not MATPLOTLIB_AVAILABLE:
             ttk.Label(info_frame, text=f"{_MATPLOTLIB_MESSAGE}").grid(row=2, column=1, sticky="w")
 
-        ttk.Label(info_frame, text="Watchers", font=("Segoe UI", 11, "bold")).grid(
+        ttk.Label(info_frame, text="Install Commands", font=("Segoe UI", 11, "bold")).grid(
             row=3, column=0, columnspan=2, sticky="w", pady=(12, 6)
         )
+        ttk.Label(
+            info_frame,
+            text=(
+                "Optional features (pandas, matplotlib):\n"
+                "python -m pip install -r requirements-optional.txt"
+            ),
+        ).grid(row=4, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(info_frame, text="Watchers", font=("Segoe UI", 11, "bold")).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(12, 6)
+        )
         watcher_status = "Safe mode" if self.safe_mode_var.get() else "Active"
-        ttk.Label(info_frame, text=f"Status: {watcher_status}").grid(row=4, column=0, sticky="w")
+        ttk.Label(info_frame, text=f"Status: {watcher_status}").grid(row=6, column=0, sticky="w")
         ttk.Label(info_frame, text=f"CSV auto-reload: {self.auto_reload_csv_var.get()}").grid(
-            row=5, column=0, sticky="w"
+            row=7, column=0, sticky="w"
         )
         ttk.Label(info_frame, text=f"Plugin auto-reload: {self.auto_reload_plugins_var.get()}").grid(
-            row=6, column=0, sticky="w"
+            row=8, column=0, sticky="w"
         )
 
         button_frame = ttk.Frame(dialog)
@@ -2113,7 +2375,8 @@ class ToolBuilderApp(tk.Tk):
         messagebox.showinfo(
             "Install Optional Features",
             "Install optional features with:\n\n"
-            "python -m pip install -r requirements-optional.txt",
+            "python -m pip install -r requirements-optional.txt\n\n"
+            "Charts require matplotlib. Advanced analyses (SUM/AVERAGE/etc.) require pandas.",
         )
 
 
