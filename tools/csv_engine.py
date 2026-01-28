@@ -175,14 +175,15 @@ def apply_filters(table: CSVTable, filters: list[FilterRule]) -> CSVTable:
 
 
 def group_count(table: CSVTable, group_by: list[str], selected_columns: list[str]) -> CSVTable:
-    if not selected_columns:
-        raise ValueError("Select at least one column for analysis.")
     for col in selected_columns:
         if col not in table.columns:
             raise ValueError(f"Columns not found: {col}")
     for col in group_by:
         if col not in table.columns:
             raise ValueError(f"Group-by column '{col}' not found.")
+    if not selected_columns:
+        counts = _count_rows(table, group_by)
+        return CSVTable(columns=list(group_by) + ["count"], rows=counts)
     groups: dict[tuple[str, ...], dict[str, int]] = {}
     for row in table.rows:
         key = tuple(row.get(col, "") for col in group_by)
@@ -198,6 +199,21 @@ def group_count(table: CSVTable, group_by: list[str], selected_columns: list[str
             row[f"COUNT_{col}"] = str(counts[col])
         result_rows.append(row)
     return CSVTable(columns=result_columns, rows=result_rows)
+
+
+def _count_rows(table: CSVTable, group_by: list[str]) -> list[dict[str, str]]:
+    if not group_by:
+        return [{"count": str(len(table.rows))}]
+    groups: dict[tuple[str, ...], int] = {}
+    for row in table.rows:
+        key = tuple(row.get(col, "") for col in group_by)
+        groups[key] = groups.get(key, 0) + 1
+    result_rows: list[dict[str, str]] = []
+    for key, count in groups.items():
+        row = {col: key[idx] for idx, col in enumerate(group_by)}
+        row["count"] = str(count)
+        result_rows.append(row)
+    return result_rows
 
 
 def self_check() -> tuple[bool, str]:
